@@ -41,7 +41,7 @@ ollama pull qwen2.5-coder:7b
 Clone the repository and install frontend dependencies:
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/siddartha1233/NEXUS.git
 cd my-ai-platform
 npm install
 ```
