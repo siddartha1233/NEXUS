@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::io::Read;
-use std::process::{Command, Stdio};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::PathBuf;
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "windows")]
@@ -10,40 +12,146 @@ use std::os::windows::process::CommandExt;
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-use std::path::PathBuf;
-
 fn resolve_memora_paths() -> (String, Option<PathBuf>) {
-    let dir_env = std::env::var("MEMORA_DIR")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .map(PathBuf::from);
+    static CACHED_PATHS: OnceLock<(String, Option<PathBuf>)> = OnceLock::new();
+    CACHED_PATHS
+        .get_or_init(|| {
+            let dir_env = std::env::var("MEMORA_DIR")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .map(PathBuf::from);
 
-    let default_dir = dir_env.or_else(|| {
-        std::env::var("USERPROFILE")
-            .or_else(|_| std::env::var("HOME"))
-            .ok()
-            .map(|home| PathBuf::from(home).join("Downloads").join("MEMORA-master"))
-            .filter(|p| p.exists())
-    });
+            let default_dir = dir_env.or_else(|| {
+                std::env::var("USERPROFILE")
+                    .or_else(|_| std::env::var("HOME"))
+                    .ok()
+                    .map(|home| PathBuf::from(home).join("Downloads").join("MEMORA-master"))
+                    .filter(|p| p.exists())
+            });
 
-    if let Ok(py_env) = std::env::var("MEMORA_PYTHON") {
-        if !py_env.trim().is_empty() {
-            return (py_env, default_dir);
-        }
+            if let Ok(py_env) = std::env::var("MEMORA_PYTHON") {
+                if !py_env.trim().is_empty() {
+                    return (py_env, default_dir);
+                }
+            }
+
+            if let Some(ref dir) = default_dir {
+                let win_venv = dir.join(".venv").join("Scripts").join("python.exe");
+                if win_venv.exists() {
+                    return (win_venv.to_string_lossy().to_string(), default_dir);
+                }
+                let unix_venv = dir.join(".venv").join("bin").join("python");
+                if unix_venv.exists() {
+                    return (unix_venv.to_string_lossy().to_string(), default_dir);
+                }
+            }
+
+            ("python".to_string(), default_dir)
+        })
+        .clone()
+}
+
+struct WarmMemoraWorker {
+    child: Child,
+    stdin: ChildStdin,
+    stdout_rx: mpsc::Receiver<String>,
+}
+
+impl WarmMemoraWorker {
+    fn spawn() -> Result<Self, String> {
+        let worker_script = r#"
+import json, sys, logging
+logging.disable(logging.CRITICAL)
+from memora.memory.manager import MemoryManager
+mgr = MemoryManager()
+for raw_line in sys.stdin:
+    raw_line = raw_line.strip()
+    if not raw_line:
+        continue
+    try:
+        req = json.loads(raw_line)
+        topic = str(req.get("topic", "")).strip()
+        res = mgr.get_context(topic, k=4)
+        print(json.dumps({"ok": True, "data": res}, ensure_ascii=False), flush=True)
+    except Exception as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False), flush=True)
+"#;
+
+        let mut cmd = memora_command();
+        cmd.args(["-u", "-c", worker_script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("Failed to start MEMORA retrieval worker: {e}"))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "Failed to capture MEMORA worker stdin.".to_string())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "Failed to capture MEMORA worker stdout.".to_string())?;
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines() {
+                match line {
+                    Ok(l) => {
+                        if tx.send(l).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Ok(Self {
+            child,
+            stdin,
+            stdout_rx: rx,
+        })
     }
 
-    if let Some(ref dir) = default_dir {
-        let win_venv = dir.join(".venv").join("Scripts").join("python.exe");
-        if win_venv.exists() {
-            return (win_venv.to_string_lossy().to_string(), default_dir);
-        }
-        let unix_venv = dir.join(".venv").join("bin").join("python");
-        if unix_venv.exists() {
-            return (unix_venv.to_string_lossy().to_string(), default_dir);
-        }
+    fn is_alive(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
     }
 
-    ("python".to_string(), default_dir)
+    fn shutdown(mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for WarmMemoraWorker {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkerEnvelope {
+    ok: bool,
+    data: Option<PyContextResponse>,
+    error: Option<String>,
+}
+
+fn warm_worker_slot() -> &'static Mutex<Option<WarmMemoraWorker>> {
+    static WORKER: OnceLock<Mutex<Option<WarmMemoraWorker>>> = OnceLock::new();
+    WORKER.get_or_init(|| Mutex::new(None))
+}
+
+pub fn reset_warm_worker() {
+    if let Ok(mut slot) = warm_worker_slot().lock() {
+        if let Some(worker) = slot.take() {
+            worker.shutdown();
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -229,59 +337,79 @@ pub async fn memora_get_context(topic: String) -> Result<MemoraContextResult, St
     }
 
     tokio::task::spawn_blocking(move || {
-        let py_script = r#"
-import json, sys, logging
-logging.disable(logging.CRITICAL)
-from memora.memory.manager import MemoryManager
-res = MemoryManager().get_context(sys.argv[1], k=4)
-print(json.dumps(res, ensure_ascii=False))
-"#;
+        let mut slot = warm_worker_slot()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
-        let mut cmd = memora_command();
-        cmd.args(["-c", py_script, &clean_topic]);
+        let needs_spawn = match slot.as_mut() {
+            Some(w) => !w.is_alive(),
+            None => true,
+        };
+        if needs_spawn {
+            if let Some(dead) = slot.take() {
+                dead.shutdown();
+            }
+            match WarmMemoraWorker::spawn() {
+                Ok(worker) => *slot = Some(worker),
+                Err(err) => {
+                    return Ok(MemoraContextResult {
+                        available: false,
+                        context: String::new(),
+                        sources: Vec::new(),
+                        error: Some(err),
+                    });
+                }
+            }
+        }
 
-        let (success, stdout, stderr) = match run_memora_with_timeout(cmd, Duration::from_secs(15)) {
-            Ok(res) => res,
-            Err(timeout_err) => {
+        let payload = serde_json::json!({ "topic": clean_topic }).to_string();
+        let line_result = if let Some(worker) = slot.as_mut() {
+            let write_res = writeln!(worker.stdin, "{payload}").and_then(|_| worker.stdin.flush());
+            if let Err(e) = write_res {
+                Err(format!("Failed to write query to MEMORA worker: {e}"))
+            } else {
+                // First request may wait briefly for Python + ChromaDB warm-up; subsequent calls return in ms
+                let deadline = Instant::now() + Duration::from_secs(20);
+                loop {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break Err("MEMORA retrieval timed out after 20 seconds.".to_string());
+                    }
+                    match worker.stdout_rx.recv_timeout(remaining) {
+                        Ok(line) => {
+                            if line.trim().starts_with('{') {
+                                break Ok(line);
+                            }
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            break Err("MEMORA retrieval timed out after 20 seconds.".to_string());
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            break Err("MEMORA worker exited unexpectedly.".to_string());
+                        }
+                    }
+                }
+            }
+        } else {
+            Err("MEMORA worker unavailable.".to_string())
+        };
+
+        let json_line = match line_result {
+            Ok(line) => line,
+            Err(err) => {
+                if let Some(broken) = slot.take() {
+                    broken.shutdown();
+                }
                 return Ok(MemoraContextResult {
                     available: false,
                     context: String::new(),
                     sources: Vec::new(),
-                    error: Some(timeout_err),
+                    error: Some(err),
                 });
             }
         };
 
-        if !success {
-            let err_msg = stderr.trim().to_string();
-            return Ok(MemoraContextResult {
-                available: false,
-                context: String::new(),
-                sources: Vec::new(),
-                error: Some(if err_msg.is_empty() {
-                    "MEMORA exited with an error.".to_string()
-                } else {
-                    err_msg
-                }),
-            });
-        }
-
-        let json_line = stdout
-            .lines()
-            .rev()
-            .find(|line| line.trim().starts_with('{'))
-            .unwrap_or("");
-
-        if json_line.is_empty() {
-            return Ok(MemoraContextResult {
-                available: false,
-                context: String::new(),
-                sources: Vec::new(),
-                error: Some("MEMORA returned no structured response.".to_string()),
-            });
-        }
-
-        let parsed: PyContextResponse = match serde_json::from_str(json_line) {
+        let envelope: WorkerEnvelope = match serde_json::from_str(&json_line) {
             Ok(v) => v,
             Err(e) => {
                 return Ok(MemoraContextResult {
@@ -291,6 +419,28 @@ print(json.dumps(res, ensure_ascii=False))
                     error: Some(format!("Failed to parse MEMORA response: {e}")),
                 });
             }
+        };
+
+        if !envelope.ok {
+            return Ok(MemoraContextResult {
+                available: false,
+                context: String::new(),
+                sources: Vec::new(),
+                error: Some(
+                    envelope
+                        .error
+                        .unwrap_or_else(|| "MEMORA query failed.".to_string()),
+                ),
+            });
+        }
+
+        let Some(parsed) = envelope.data else {
+            return Ok(MemoraContextResult {
+                available: false,
+                context: String::new(),
+                sources: Vec::new(),
+                error: None,
+            });
         };
 
         let context = parsed.context.unwrap_or_default();
@@ -358,6 +508,8 @@ pub async fn memora_ingest() -> Result<String, String> {
         let (success, stdout, stderr) = run_memora_with_timeout(cmd, Duration::from_secs(120))?;
 
         if success {
+            // Reset warm retrieval worker so newly ingested notes are immediately visible
+            reset_warm_worker();
             Ok(stdout)
         } else {
             Err(stderr)

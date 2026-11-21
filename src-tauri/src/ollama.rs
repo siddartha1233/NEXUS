@@ -105,6 +105,22 @@ pub enum StreamEvent {
 }
 
 #[tauri::command]
+pub async fn groq_get_active_models(
+    state: State<'_, OllamaState>,
+    db_state: State<'_, crate::db::DbState>,
+) -> Result<Vec<crate::cloud_llm::GroqModelItem>, String> {
+    let api_key = {
+        let conn = db_state
+            .conn
+            .lock()
+            .map_err(|_| "Database lock poisoned".to_string())?;
+        crate::db::get_setting_internal(&conn, "groq_api_key").unwrap_or_default()
+    };
+
+    crate::cloud_llm::fetch_active_groq_models(&state.client, &api_key).await
+}
+
+#[tauri::command]
 pub async fn ollama_get_models(state: State<'_, OllamaState>) -> Result<Vec<OllamaModel>, String> {
     let url = format!("{OLLAMA_BASE_URL}/api/tags");
 
@@ -229,8 +245,10 @@ fn process_json_line(line: &str, on_event: &Channel<StreamEvent>) -> Result<(), 
 #[tauri::command]
 pub async fn ollama_chat_stream(
     state: State<'_, OllamaState>,
+    db_state: State<'_, crate::db::DbState>,
     model: String,
     messages: Vec<ChatMessage>,
+    workspace_id: Option<String>,
     on_event: Channel<StreamEvent>,
 ) -> Result<(), String> {
     let notify = Arc::new(Notify::new());
@@ -242,7 +260,38 @@ pub async fn ollama_chat_stream(
         *guard = Some(notify.clone());
     }
 
-    let result = run_stream(&state.client, model, messages, &on_event, notify.clone()).await;
+    let result = if crate::cloud_llm::is_cloud_model(&model) {
+        let key_result: Result<String, String> = (|| {
+            let conn = db_state
+                .conn
+                .lock()
+                .map_err(|_| "Database lock poisoned".to_string())?;
+            if let Some(ref ws_id) = workspace_id {
+                let offline_key = format!("ws_offline_{ws_id}");
+                if crate::db::get_setting_internal(&conn, &offline_key).as_deref() == Some("true") {
+                    return Err("Strict Offline Mode is active for this workspace. Cloud models are blocked.".to_string());
+                }
+            }
+            Ok(crate::db::get_setting_internal(&conn, "groq_api_key").unwrap_or_default())
+        })();
+
+        match key_result {
+            Ok(api_key) => {
+                crate::cloud_llm::stream_groq_chat(
+                    &state.client,
+                    &api_key,
+                    &model,
+                    &messages,
+                    &on_event,
+                    notify.clone(),
+                )
+                .await
+            }
+            Err(err) => Err(err),
+        }
+    } else {
+        run_stream(&state.client, model, messages, &on_event, notify.clone()).await
+    };
 
     {
         let mut guard = state.cancel_notify.lock().await;

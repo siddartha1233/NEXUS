@@ -155,3 +155,22 @@ export async function resetSandboxDatabase(): Promise<string> {
     );
   }
 }
+
+export async function getAppSetting(key: string): Promise<string | null> {
+  try {
+    return await invoke<string | null>("db_get_setting", { key });
+  } catch (error) {
+    console.error(`Failed to fetch app setting ${key}:`, error);
+    return null;
+  }
+}
+
+export async function setAppSetting(key: string, value: string): Promise<void> {
+  try {
+    await invoke<void>("db_set_setting", { key, value });
+  } catch (error) {
+    throw new Error(
+      typeof error === "string" ? error : `Failed to save setting ${key}.`
+    );
+  }
+}

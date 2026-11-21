@@ -27,6 +27,9 @@ export function useWorkspaces(onActiveWorkspaceDeleted?: () => void) {
         setActiveWorkspace(created);
       } catch (err) {
         console.error("Failed to create workspace:", err);
+        throw err instanceof Error
+          ? err
+          : new Error(typeof err === "string" ? err : "Failed to create workspace.");
       }
     },
     []
@@ -43,6 +46,9 @@ export function useWorkspaces(onActiveWorkspaceDeleted?: () => void) {
         }
       } catch (err) {
         console.error("Failed to delete workspace:", err);
+        throw err instanceof Error
+          ? err
+          : new Error(typeof err === "string" ? err : "Failed to delete workspace.");
       }
     },
     [activeWorkspace?.id, onActiveWorkspaceDeleted]

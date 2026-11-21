@@ -3,13 +3,16 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+use tauri::State;
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const EXECUTION_TIMEOUT_SECS: u64 = 10;
+const MAX_SQL_ROWS: usize = 500;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -21,13 +24,9 @@ pub struct ExecutionResult {
     pub success: bool,
 }
 
+#[cfg(test)]
 fn get_sandbox_db_path() -> PathBuf {
-    let app_dir = std::env::var("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir())
-        .join("nexus");
-    let _ = fs::create_dir_all(&app_dir);
-    app_dir.join("sandbox.db")
+    std::env::temp_dir().join("nexus_test_sandbox.db")
 }
 
 fn init_sandbox_db(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -226,7 +225,43 @@ fn split_sql_statements(code: &str) -> Vec<String> {
     statements
 }
 
+/// Strips leading SQL single-line (`--`) and block (`/* ... */`) comments so statement keyword inspection cannot be bypassed
+fn strip_leading_sql_comments(stmt: &str) -> &str {
+    let mut s = stmt.trim();
+    loop {
+        if s.starts_with("--") {
+            if let Some(nl) = s.find('\n') {
+                s = s[nl + 1..].trim();
+            } else {
+                return "";
+            }
+        } else if s.starts_with("/*") {
+            if let Some(end) = s.find("*/") {
+                s = s[end + 2..].trim();
+            } else {
+                return "";
+            }
+        } else {
+            break;
+        }
+    }
+    s
+}
+
+#[cfg(test)]
 fn execute_sql_sandbox(code: &str) -> ExecutionResult {
+    execute_sql_sandbox_with_options(
+        code,
+        get_sandbox_db_path(),
+        Duration::from_secs(EXECUTION_TIMEOUT_SECS),
+    )
+}
+
+fn execute_sql_sandbox_with_options(
+    code: &str,
+    db_path: PathBuf,
+    timeout: Duration,
+) -> ExecutionResult {
     let start = Instant::now();
 
     // Split code by quote/comment-aware statement boundaries
@@ -243,11 +278,13 @@ fn execute_sql_sandbox(code: &str) -> ExecutionResult {
     }
 
     for stmt in &statements {
-        let trimmed_lower = stmt.to_lowercase();
-        if trimmed_lower.starts_with("attach")
-            || trimmed_lower.starts_with("detach")
-            || trimmed_lower.contains("load_extension")
-            || trimmed_lower.contains("vacuum into")
+        let cleaned_lower = strip_leading_sql_comments(stmt).to_lowercase();
+        if cleaned_lower.starts_with("attach")
+            || cleaned_lower.starts_with("detach")
+            || cleaned_lower.contains("load_extension")
+            || cleaned_lower.contains("vacuum into")
+            || cleaned_lower.contains("attach ")
+            || cleaned_lower.contains("detach ")
         {
             return ExecutionResult {
                 stdout: String::new(),
@@ -259,7 +296,9 @@ fn execute_sql_sandbox(code: &str) -> ExecutionResult {
         }
     }
 
-    let db_path = get_sandbox_db_path();
+    if let Some(parent) = db_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
 
     let mut conn = match Connection::open(&db_path) {
         Ok(c) => c,
@@ -287,6 +326,22 @@ fn execute_sql_sandbox(code: &str) -> ExecutionResult {
     // Lock down SQLite sandbox: prevent ATTACH DATABASE and external file access
     conn.set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_ATTACHED, 0);
 
+    // Watchdog thread interrupts runaway queries (e.g. infinite recursive CTEs) after timeout
+    let interrupt_handle = conn.get_interrupt_handle();
+    let watchdog_signal = Arc::new((Mutex::new((false, false)), Condvar::new()));
+    let watchdog_signal_clone = Arc::clone(&watchdog_signal);
+    let watchdog_thread = std::thread::spawn(move || {
+        let (lock, cvar) = &*watchdog_signal_clone;
+        let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut state, wait_res) = cvar
+            .wait_timeout_while(guard, timeout, |s| !s.0)
+            .unwrap_or_else(|e| e.into_inner());
+        if !state.0 && wait_res.timed_out() {
+            state.1 = true;
+            interrupt_handle.interrupt();
+        }
+    });
+
     let mut output_lines = Vec::new();
     let mut had_error = false;
     let mut err_msg = String::new();
@@ -294,6 +349,13 @@ fn execute_sql_sandbox(code: &str) -> ExecutionResult {
     let tx = match conn.transaction() {
         Ok(t) => t,
         Err(e) => {
+            {
+                let (lock, cvar) = &*watchdog_signal;
+                let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+                state.0 = true;
+                cvar.notify_one();
+            }
+            let _ = watchdog_thread.join();
             return ExecutionResult {
                 stdout: String::new(),
                 stderr: format!("Failed to start SQL transaction: {e}"),
@@ -305,11 +367,11 @@ fn execute_sql_sandbox(code: &str) -> ExecutionResult {
     };
 
     for (stmt_idx, stmt) in statements.iter().enumerate() {
-        let trimmed_lower = stmt.to_lowercase();
-        let is_query = trimmed_lower.starts_with("select")
-            || trimmed_lower.starts_with("pragma")
-            || trimmed_lower.starts_with("explain")
-            || trimmed_lower.starts_with("with");
+        let cleaned_lower = strip_leading_sql_comments(stmt).to_lowercase();
+        let is_query = cleaned_lower.starts_with("select")
+            || cleaned_lower.starts_with("pragma")
+            || cleaned_lower.starts_with("explain")
+            || cleaned_lower.starts_with("with");
 
         if is_query {
             match tx.prepare(stmt) {
@@ -321,6 +383,7 @@ fn execute_sql_sandbox(code: &str) -> ExecutionResult {
                         .map(|s| s.to_string())
                         .collect();
 
+                    // Cap row materialization at MAX_SQL_ROWS + 1 so large cross-joins cannot OOM the process
                     let rows_res: Result<Vec<Vec<String>>, rusqlite::Error> = prepared
                         .query_map([], |row| {
                             let mut row_vals = Vec::with_capacity(col_count);
@@ -338,10 +401,15 @@ fn execute_sql_sandbox(code: &str) -> ExecutionResult {
                             }
                             Ok(row_vals)
                         })
-                        .and_then(|mapped| mapped.collect());
+                        .and_then(|mapped| mapped.take(MAX_SQL_ROWS + 1).collect());
 
                     match rows_res {
-                        Ok(rows) => {
+                        Ok(mut rows) => {
+                            let truncated = rows.len() > MAX_SQL_ROWS;
+                            if truncated {
+                                rows.truncate(MAX_SQL_ROWS);
+                            }
+
                             if statements.len() > 1 {
                                 output_lines.push(format!("--- Statement {} ---", stmt_idx + 1));
                             }
@@ -387,7 +455,15 @@ fn execute_sql_sandbox(code: &str) -> ExecutionResult {
                                 output_lines.push(row_str);
                             }
 
-                            output_lines.push(format!("({} row(s) returned)\n", rows.len()));
+                            if truncated {
+                                output_lines.push(format!(
+                                    "({} rows shown; result truncated at {} rows)\n",
+                                    rows.len(),
+                                    MAX_SQL_ROWS
+                                ));
+                            } else {
+                                output_lines.push(format!("({} row(s) returned)\n", rows.len()));
+                            }
                         }
                         Err(e) => {
                             had_error = true;
@@ -431,88 +507,118 @@ fn execute_sql_sandbox(code: &str) -> ExecutionResult {
         err_msg = format!("SQL transaction commit error: {e}");
     }
 
+    let timed_out = {
+        let (lock, cvar) = &*watchdog_signal;
+        let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+        state.0 = true;
+        cvar.notify_one();
+        state.1
+    };
+    let _ = watchdog_thread.join();
+
+    if timed_out {
+        had_error = true;
+        err_msg = format!(
+            "SQL execution timed out after {} seconds (query interrupted).",
+            timeout.as_secs().max(1)
+        );
+    }
+
     let elapsed = start.elapsed().as_millis() as u64;
     ExecutionResult {
         stdout: output_lines.join("\n"),
         stderr: err_msg,
-        exit_code: if had_error { Some(1) } else { Some(0) },
+        exit_code: if had_error { Some(if timed_out { -1 } else { 1 }) } else { Some(0) },
         execution_time_ms: elapsed,
         success: !had_error,
     }
 }
 
 fn resolve_python_command() -> (String, Vec<String>) {
-    let mut candidates: Vec<(String, Vec<String>)> = Vec::new();
+    static CACHED_PYTHON: OnceLock<(String, Vec<String>)> = OnceLock::new();
+    CACHED_PYTHON
+        .get_or_init(|| {
+            let mut candidates: Vec<(String, Vec<String>)> = Vec::new();
 
-    if let Ok(env_py) = std::env::var("NEXUS_PYTHON_PATH") {
-        if !env_py.trim().is_empty() {
-            candidates.push((env_py, vec![]));
-        }
-    }
-
-    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
-        let launcher = PathBuf::from(local_app_data)
-            .join("Programs")
-            .join("Python")
-            .join("Launcher")
-            .join("py.exe");
-        if launcher.exists() {
-            candidates.push((launcher.to_string_lossy().to_string(), vec!["-3".to_string()]));
-        }
-    }
-
-    candidates.push(("py".to_string(), vec!["-3".to_string()]));
-    candidates.push(("python3".to_string(), vec![]));
-    candidates.push(("python".to_string(), vec![]));
-
-    for (cmd, args) in candidates {
-        let mut test_cmd = Command::new(&cmd);
-        test_cmd.args(&args).arg("--version");
-        #[cfg(target_os = "windows")]
-        test_cmd.creation_flags(CREATE_NO_WINDOW);
-
-        if let Ok(output) = test_cmd.output() {
-            if output.status.success() {
-                return (cmd, args);
+            if let Ok(env_py) = std::env::var("NEXUS_PYTHON_PATH") {
+                if !env_py.trim().is_empty() {
+                    candidates.push((env_py, vec![]));
+                }
             }
-        }
-    }
 
-    ("python".to_string(), vec![])
+            if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+                let launcher = PathBuf::from(local_app_data)
+                    .join("Programs")
+                    .join("Python")
+                    .join("Launcher")
+                    .join("py.exe");
+                if launcher.exists() {
+                    candidates.push((
+                        launcher.to_string_lossy().to_string(),
+                        vec!["-3".to_string()],
+                    ));
+                }
+            }
+
+            candidates.push(("py".to_string(), vec!["-3".to_string()]));
+            candidates.push(("python3".to_string(), vec![]));
+            candidates.push(("python".to_string(), vec![]));
+
+            for (cmd, args) in candidates {
+                let mut test_cmd = Command::new(&cmd);
+                test_cmd.args(&args).arg("--version");
+                #[cfg(target_os = "windows")]
+                test_cmd.creation_flags(CREATE_NO_WINDOW);
+
+                if let Ok(output) = test_cmd.output() {
+                    if output.status.success() {
+                        return (cmd, args);
+                    }
+                }
+            }
+
+            ("python".to_string(), vec![])
+        })
+        .clone()
 }
 
 fn resolve_node_command() -> String {
-    let mut candidates: Vec<String> = Vec::new();
+    static CACHED_NODE: OnceLock<String> = OnceLock::new();
+    CACHED_NODE
+        .get_or_init(|| {
+            let mut candidates: Vec<String> = Vec::new();
 
-    if let Ok(env_node) = std::env::var("NEXUS_NODE_PATH") {
-        if !env_node.trim().is_empty() {
-            candidates.push(env_node);
-        }
-    }
-
-    candidates.push("node".to_string());
-
-    if let Ok(prog_files) = std::env::var("ProgramFiles") {
-        let node_exe = PathBuf::from(prog_files).join("nodejs").join("node.exe");
-        if node_exe.exists() {
-            candidates.push(node_exe.to_string_lossy().to_string());
-        }
-    }
-
-    for cmd in candidates {
-        let mut test_cmd = Command::new(&cmd);
-        test_cmd.arg("--version");
-        #[cfg(target_os = "windows")]
-        test_cmd.creation_flags(CREATE_NO_WINDOW);
-
-        if let Ok(output) = test_cmd.output() {
-            if output.status.success() {
-                return cmd;
+            if let Ok(env_node) = std::env::var("NEXUS_NODE_PATH") {
+                if !env_node.trim().is_empty() {
+                    candidates.push(env_node);
+                }
             }
-        }
-    }
 
-    "node".to_string()
+            candidates.push("node".to_string());
+
+            if let Ok(prog_files) = std::env::var("ProgramFiles") {
+                let node_exe = PathBuf::from(prog_files).join("nodejs").join("node.exe");
+                if node_exe.exists() {
+                    candidates.push(node_exe.to_string_lossy().to_string());
+                }
+            }
+
+            for cmd in candidates {
+                let mut test_cmd = Command::new(&cmd);
+                test_cmd.arg("--version");
+                #[cfg(target_os = "windows")]
+                test_cmd.creation_flags(CREATE_NO_WINDOW);
+
+                if let Ok(output) = test_cmd.output() {
+                    if output.status.success() {
+                        return cmd;
+                    }
+                }
+            }
+
+            "node".to_string()
+        })
+        .clone()
 }
 
 fn read_pipe_bounded<R: std::io::Read>(mut reader: R, max_bytes: usize) -> String {
@@ -599,6 +705,14 @@ fn run_command_with_timeout(mut cmd: Command, timeout: Duration) -> ExecutionRes
             }
             Ok(None) => {
                 if start.elapsed() >= timeout {
+                    #[cfg(target_os = "windows")]
+                    {
+                        let pid = child.id().to_string();
+                        let _ = Command::new("taskkill")
+                            .args(["/F", "/T", "/PID", &pid])
+                            .creation_flags(CREATE_NO_WINDOW)
+                            .output();
+                    }
                     let _ = child.kill();
                     let _ = child.wait();
                     let stdout = stdout_handle.join().unwrap_or_default();
@@ -639,13 +753,22 @@ fn run_command_with_timeout(mut cmd: Command, timeout: Duration) -> ExecutionRes
 }
 
 #[tauri::command]
-pub async fn execute_code_snippet(language: String, code: String) -> Result<ExecutionResult, String> {
+pub async fn execute_code_snippet(
+    db_state: State<'_, crate::db::DbState>,
+    language: String,
+    code: String,
+) -> Result<ExecutionResult, String> {
+    let sandbox_db_path = db_state.app_data_dir.join("sandbox.db");
     tokio::task::spawn_blocking(move || {
         let lang = language.to_lowercase().trim().to_string();
         let timeout = Duration::from_secs(EXECUTION_TIMEOUT_SECS);
 
         match lang.as_str() {
-            "sql" | "sqlite" | "sqlite3" => Ok(execute_sql_sandbox(&code)),
+            "sql" | "sqlite" | "sqlite3" => Ok(execute_sql_sandbox_with_options(
+                &code,
+                sandbox_db_path,
+                timeout,
+            )),
             "python" | "py" | "python3" => {
                 let (py_cmd, py_args) = resolve_python_command();
                 let temp_dir = std::env::temp_dir().join("nexus_runner");
@@ -777,5 +900,37 @@ mod tests {
         let ext_res = execute_sql_sandbox("SELECT load_extension('evil.dll');");
         assert!(!ext_res.success);
         assert!(ext_res.stderr.contains("Blocked"));
+
+        let commented_attach = execute_sql_sandbox("/* bypass */ -- line\nATTACH DATABASE 'nexus.db' AS stolen;");
+        assert!(!commented_attach.success);
+        assert!(commented_attach.stderr.contains("Blocked"));
+    }
+
+    #[test]
+    fn test_sql_sandbox_caps_rows_and_interrupts_runaway_cte() {
+        let temp_db = std::env::temp_dir().join(format!(
+            "nexus_sql_bounds_test_{}.db",
+            std::process::id()
+        ));
+
+        // 1. Verify row truncation at MAX_SQL_ROWS (500)
+        let many_rows = execute_sql_sandbox_with_options(
+            "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 1200) SELECT x FROM cnt;",
+            temp_db.clone(),
+            Duration::from_secs(5),
+        );
+        assert!(many_rows.success);
+        assert!(many_rows.stdout.contains("truncated at 500 rows"));
+
+        // 2. Verify watchdog interrupts an infinite recursive query cleanly
+        let infinite_cte = execute_sql_sandbox_with_options(
+            "WITH RECURSIVE inf(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM inf) SELECT count(*) FROM inf;",
+            temp_db.clone(),
+            Duration::from_millis(150),
+        );
+        assert!(!infinite_cte.success);
+        assert!(infinite_cte.stderr.contains("timed out"));
+
+        let _ = fs::remove_file(&temp_db);
     }
 }

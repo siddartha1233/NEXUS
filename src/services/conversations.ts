@@ -50,10 +50,13 @@ export async function deleteConversation(id: string): Promise<void> {
 }
 
 export async function getConversationMessages(
-  conversationId: string
+  conversationId: string,
+  options?: { beforeId?: number; limit?: number }
 ): Promise<StoredMessage[]> {
   return invoke<StoredMessage[]>("db_get_messages", {
     conversationId,
+    beforeId: options?.beforeId ?? null,
+    limit: options?.limit ?? null,
   });
 }
 

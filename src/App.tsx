@@ -13,7 +13,14 @@ import { WorkspacesView } from "./components/WorkspacesView";
 import {
   exportConversationJson,
   exportConversationMarkdown,
+  getAppSetting,
 } from "./services/settings";
+import {
+  performWebSearch,
+  buildWebSearchPromptContext,
+  type WebSearchResult,
+} from "./services/webSearch";
+import { isCloudModel } from "./services/cloudModels";
 import { recordTelemetry } from "./services/telemetry";
 import {
   addConversationMessage,
@@ -74,6 +81,34 @@ function buildMemoraSystemPrompt(context: string): ChatMessage {
   };
 }
 
+// Applies a sliding context window budget so long chats never exceed free-tier TPM/payload or local VRAM limits
+function applyContextWindowBudget(
+  history: ChatMessage[],
+  maxTurns = 16,
+  maxTotalChars = 24000
+): ChatMessage[] {
+  const systemMsgs = history.filter((m) => m.role === "system");
+  const nonSystem = history.filter((m) => m.role !== "system");
+
+  const recent = nonSystem.slice(-maxTurns);
+  const kept: ChatMessage[] = [];
+  let charBudget = maxTotalChars - systemMsgs.reduce((acc, m) => acc + m.content.length, 0);
+
+  // Always retain the latest user message, then walk backwards while budget remains
+  for (let idx = recent.length - 1; idx >= 0; idx--) {
+    const msg = recent[idx];
+    const len = msg.content.length;
+    if (kept.length === 0 || charBudget - len >= 0) {
+      kept.unshift(msg);
+      charBudget -= len;
+    } else {
+      break;
+    }
+  }
+
+  return [...systemMsgs, ...kept];
+}
+
 function App() {
   const [activePage, setActivePage] = useState("chat");
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -90,23 +125,46 @@ function App() {
   const [memoraEnabled, setMemoraEnabled] = useState(true);
   const [memoraAvailable, setMemoraAvailable] = useState(false);
   const [memoraSources, setMemoraSources] = useState<MemoraSourceItem[]>([]);
-  const [memorizedMessageIndices, setMemorizedMessageIndices] = useState<
-    Set<number>
+  const [memorizedMessageKeys, setMemorizedMessageKeys] = useState<
+    Set<string>
   >(new Set());
-  const [savingMemoryIndex, setSavingMemoryIndex] = useState<number | null>(
-    null
-  );
+  const [savingMemoryKey, setSavingMemoryKey] = useState<string | null>(null);
   const [lastRetrievedSources, setLastRetrievedSources] = useState<string[]>(
     []
   );
+  const [webSearchEnabled, setWebSearchEnabled] = useState(false);
+  const [isSearchingWeb, setIsSearchingWeb] = useState(false);
+  const [liveWebSources, setLiveWebSources] = useState<WebSearchResult[]>([]);
+  const [webSearchNotice, setWebSearchNotice] = useState<string | null>(null);
   const [analytics, setAnalytics] = useState<AnalyticsData>({
     totalTokensGenerated: 0,
     totalPromptsSent: 0,
   });
   const [isGenerating, setIsGenerating] = useState(false);
   const [generationError, setGenerationError] = useState("");
+  const [hasOlderMessages, setHasOlderMessages] = useState(false);
+  const [isLoadingOlderMessages, setIsLoadingOlderMessages] = useState(false);
   const abortControllerRef = useRef<AbortController | null>(null);
   const conversationsReqIdRef = useRef(0);
+  const chatContentRef = useRef<HTMLDivElement | null>(null);
+  const chatBottomRef = useRef<HTMLDivElement | null>(null);
+  const shouldAutoScrollRef = useRef(true);
+
+  const handleChatScroll = useCallback(() => {
+    const el = chatContentRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    shouldAutoScrollRef.current = distanceFromBottom < 96;
+  }, []);
+
+  useEffect(() => {
+    if (activePage === "chat" && messages.length > 0 && shouldAutoScrollRef.current) {
+      chatBottomRef.current?.scrollIntoView({
+        behavior: isGenerating ? "auto" : "smooth",
+        block: "end",
+      });
+    }
+  }, [activePage, isGenerating, messages]);
 
   const {
     selectedModel,
@@ -115,6 +173,7 @@ function App() {
     runningModels,
     setRunningModels,
     availableModels,
+    cloudModels,
     connectionStatus,
     setConnectionStatus,
     isRefreshingModels,
@@ -123,13 +182,19 @@ function App() {
     refreshOllamaState,
     handleSelectModel,
     handleUnloadModel,
+    autoFallbackToLocal,
   } = useOllamaModels(isGenerating);
+
+  const [workspaceStrictOffline, setWorkspaceStrictOffline] = useState(false);
 
   const resetActiveChatView = useCallback(() => {
     setActiveConversationId(null);
     setMessages([]);
-    setMemorizedMessageIndices(new Set());
+    setHasOlderMessages(false);
+    setMemorizedMessageKeys(new Set());
     setLastRetrievedSources([]);
+    setLiveWebSources([]);
+    setWebSearchNotice(null);
     setGenerationError("");
   }, []);
 
@@ -141,6 +206,36 @@ function App() {
     handleCreateWorkspace,
     handleDeleteWorkspace,
   } = useWorkspaces(resetActiveChatView);
+
+  const handleWorkspaceStrictOfflineChange = useCallback(
+    (isStrict: boolean) => {
+      setWorkspaceStrictOffline(isStrict);
+      if (isStrict) {
+        setWebSearchEnabled(false);
+        if (isCloudModel(selectedModel)) {
+          autoFallbackToLocal();
+        }
+      }
+    },
+    [autoFallbackToLocal, selectedModel]
+  );
+
+  // Sync workspace strict offline mode
+  useEffect(() => {
+    let cancelled = false;
+    if (activeWorkspace) {
+      void getAppSetting(`ws_offline_${activeWorkspace.id}`).then((val) => {
+        if (!cancelled) {
+          handleWorkspaceStrictOfflineChange(val === "true");
+        }
+      });
+    } else {
+      setWorkspaceStrictOffline(false);
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [activeWorkspace, handleWorkspaceStrictOfflineChange]);
 
   const refreshConversations = useCallback(async () => {
     const reqId = ++conversationsReqIdRef.current;
@@ -189,8 +284,11 @@ function App() {
         if (!isGenerating) {
           setActiveConversationId(null);
           setMessages([]);
-          setMemorizedMessageIndices(new Set());
+          setHasOlderMessages(false);
+          setMemorizedMessageKeys(new Set());
           setLastRetrievedSources([]);
+          setLiveWebSources([]);
+          setWebSearchNotice(null);
           setGenerationError("");
           setActivePage("chat");
         }
@@ -211,7 +309,9 @@ function App() {
     if (isGenerating) return;
 
     try {
-      const stored = await getConversationMessages(conv.id);
+      const pageSize = 500;
+      const stored = await getConversationMessages(conv.id, { limit: pageSize });
+      shouldAutoScrollRef.current = true;
       setActiveConversationId(conv.id);
       setMessages(
         stored.map((m) => ({
@@ -220,8 +320,11 @@ function App() {
           content: m.content,
         }))
       );
-      setMemorizedMessageIndices(new Set());
+      setHasOlderMessages(stored.length === pageSize);
+      setMemorizedMessageKeys(new Set());
       setLastRetrievedSources([]);
+      setLiveWebSources([]);
+      setWebSearchNotice(null);
       setGenerationError("");
       setActivePage("chat");
     } catch (error) {
@@ -231,6 +334,40 @@ function App() {
           ? error.message
           : "Unable to load conversation messages."
       );
+    }
+  }
+
+  async function handleLoadOlderMessages() {
+    if (!activeConversationId || isLoadingOlderMessages || isGenerating) return;
+    const oldestNumeric = messages.find((m) => typeof m.id === "number");
+    if (!oldestNumeric || typeof oldestNumeric.id !== "number") {
+      setHasOlderMessages(false);
+      return;
+    }
+
+    setIsLoadingOlderMessages(true);
+    try {
+      const pageSize = 500;
+      const older = await getConversationMessages(activeConversationId, {
+        beforeId: oldestNumeric.id,
+        limit: pageSize,
+      });
+      if (older.length > 0) {
+        shouldAutoScrollRef.current = false;
+        setMessages((prev) => [
+          ...older.map((m) => ({
+            id: m.id,
+            role: m.role,
+            content: m.content,
+          })),
+          ...prev,
+        ]);
+      }
+      setHasOlderMessages(older.length === pageSize);
+    } catch (error) {
+      console.error("Failed to load older messages:", error);
+    } finally {
+      setIsLoadingOlderMessages(false);
     }
   }
 
@@ -265,8 +402,11 @@ function App() {
       if (activeConversationId === id) {
         setActiveConversationId(null);
         setMessages([]);
-        setMemorizedMessageIndices(new Set());
+        setHasOlderMessages(false);
+        setMemorizedMessageKeys(new Set());
         setLastRetrievedSources([]);
+        setLiveWebSources([]);
+        setWebSearchNotice(null);
         setGenerationError("");
       }
     } catch (error) {
@@ -274,19 +414,19 @@ function App() {
     }
   }
 
-  async function handleSaveToMemory(content: string, index: number) {
-    if (!content.trim() || savingMemoryIndex !== null) return;
-    setSavingMemoryIndex(index);
+  async function handleSaveToMemory(content: string, messageKey: string) {
+    if (!content.trim() || savingMemoryKey !== null) return;
+    setSavingMemoryKey(messageKey);
     try {
       const ok = await memorizeToMemora(content.trim(), "nexus_chat");
       if (ok) {
-        setMemorizedMessageIndices((prev) => new Set(prev).add(index));
+        setMemorizedMessageKeys((prev) => new Set(prev).add(messageKey));
         void refreshMemoraSources();
       }
     } catch (err) {
       console.error("Failed to memorize to MEMORA:", err);
     } finally {
-      setSavingMemoryIndex(null);
+      setSavingMemoryKey(null);
     }
   }
 
@@ -328,10 +468,12 @@ function App() {
 
     const conversationHistory = [...messages, userMessage];
 
+    shouldAutoScrollRef.current = true;
     setMessages([...conversationHistory, assistantMessage]);
     setMessage("");
     setIsGenerating(true);
     setGenerationError("");
+    setWebSearchNotice(null);
 
     let convId = activeConversationId;
     try {
@@ -412,10 +554,53 @@ function App() {
       }
     }
 
+    // 3. Live Web Search Grounding (Real-time current events, sports, news)
+    if (webSearchEnabled && !workspaceStrictOffline) {
+      setIsSearchingWeb(true);
+      try {
+        const searchResults = await performWebSearch(
+          trimmed,
+          activeWorkspace?.id ?? null
+        );
+        setLiveWebSources(searchResults);
+        if (searchResults.length > 0) {
+          const webGrounding = buildWebSearchPromptContext(searchResults);
+          const lastIdx = effectiveHistory.length - 1;
+          if (lastIdx >= 0 && effectiveHistory[lastIdx].role === "user") {
+            effectiveHistory = [
+              ...effectiveHistory.slice(0, lastIdx),
+              {
+                role: "user",
+                content: `${webGrounding}\n\nUSER QUESTION:\n${effectiveHistory[lastIdx].content}`,
+              },
+            ];
+          }
+        } else {
+          setWebSearchNotice(
+            "🌐 Live web search returned no results for this query. Answering from model knowledge."
+          );
+        }
+      } catch (err) {
+        console.warn("Live web search failed, proceeding without web context:", err);
+        const searchErrMsg = err instanceof Error ? err.message : String(err);
+        setWebSearchNotice(
+          searchErrMsg.includes("Strict Offline")
+            ? `🔒 ${searchErrMsg}`
+            : `🌐 Live web search unavailable (${searchErrMsg}). Answering from model knowledge.`
+        );
+      } finally {
+        setIsSearchingWeb(false);
+      }
+    } else {
+      setLiveWebSources([]);
+    }
+
+    const budgetedHistory = applyContextWindowBudget(effectiveHistory);
+
     try {
       await streamOllamaChat(
         selectedModel,
-        effectiveHistory,
+        budgetedHistory,
         (token) => {
           assistantText += token;
           setMessages((previous) => {
@@ -452,13 +637,16 @@ function App() {
             metrics.totalDurationMs ?? 0,
             metrics.tokensPerSec
           );
-        }
+        },
+        activeWorkspace?.id ?? null
       );
 
-      setConnectionStatus("connected");
-      void getRunningOllamaModels()
-        .then(setRunningModels)
-        .catch(() => {});
+      if (!isCloudModel(selectedModel)) {
+        setConnectionStatus("connected");
+        void getRunningOllamaModels()
+          .then(setRunningModels)
+          .catch(() => {});
+      }
     } catch (error) {
       const isAbort =
         error instanceof DOMException && error.name === "AbortError";
@@ -480,13 +668,39 @@ function App() {
           });
         }
       } else {
-        console.error("Ollama chat error:", error);
+        console.error("Chat streaming error:", error);
+        const errMsg = error instanceof Error ? error.message : String(error);
+        const isRateLimit = errMsg.includes("RATE_LIMIT") || errMsg.includes("429");
+        const isAuthError = errMsg.includes("AUTH_ERROR");
+        const isCloudNetworkDrop =
+          errMsg.includes("Failed to connect to Groq") ||
+          errMsg.includes("Stream interrupted from Groq") ||
+          errMsg.includes("timed out") ||
+          errMsg.includes("NETWORK_ERROR");
 
-        setGenerationError(
-          error instanceof Error
-            ? error.message
-            : "Something went wrong while generating a response."
-        );
+        if (isCloudModel(selectedModel) && (isRateLimit || isCloudNetworkDrop)) {
+          const fallbackSetting = await getAppSetting("cloud_auto_fallback");
+          const shouldAutoFallback = fallbackSetting === null || fallbackSetting === "true";
+          const reasonLabel = isRateLimit
+            ? "Groq free rate limit reached (30 RPM)"
+            : "Groq cloud connection dropped or timed out";
+          if (shouldAutoFallback) {
+            const fallback = autoFallbackToLocal();
+            setGenerationError(
+              `⚡ ${reasonLabel}. Auto-switched to local model (${fallback}). Click Send to run locally.`
+            );
+          } else {
+            setGenerationError(
+              `⚡ ${reasonLabel}. Wait a moment or switch to a local model.`
+            );
+          }
+        } else if (isAuthError) {
+          setGenerationError(
+            "🔑 Groq API key is missing or invalid. Open Settings -> Cloud Free-Tier Inference to add your free key."
+          );
+        } else {
+          setGenerationError(errMsg);
+        }
 
         if (
           error instanceof TypeError ||
@@ -495,6 +709,11 @@ function App() {
         ) {
           setConnectionStatus("disconnected");
         }
+      }
+
+      if (!assistantText.trim()) {
+        setLiveWebSources([]);
+        setLastRetrievedSources([]);
       }
 
       setMessages((previous) => {
@@ -541,14 +760,20 @@ function App() {
     setActivePage("workspaces");
   }
 
-  function startNewChat() {
+  function startNewChat(prefillPrompt?: string) {
     if (isGenerating) return;
 
     setActiveConversationId(null);
     setMessages([]);
-    setMemorizedMessageIndices(new Set());
+    setHasOlderMessages(false);
+    setMemorizedMessageKeys(new Set());
     setLastRetrievedSources([]);
+    setLiveWebSources([]);
+    setWebSearchNotice(null);
     setGenerationError("");
+    if (typeof prefillPrompt === "string") {
+      setMessage(prefillPrompt);
+    }
     setActivePage("chat");
   }
 
@@ -574,7 +799,7 @@ function App() {
 
         <button
           className="new-chat-button"
-          onClick={startNewChat}
+          onClick={() => startNewChat()}
           disabled={isGenerating}
         >
           <span className="nav-icon"><SidebarIcon name="plus" /></span>
@@ -591,9 +816,12 @@ function App() {
               className={`nav-item ${activePage === item.id ? "active" : ""}`}
               onClick={() => {
                 if (item.id === "chat" && activeWorkspace) {
+                  if (isGenerating) {
+                    setActivePage("chat");
+                    return;
+                  }
                   setActiveWorkspace(null);
-                  setActiveConversationId(null);
-                  setMessages([]);
+                  resetActiveChatView();
                 }
                 setActivePage(item.id);
               }}
@@ -718,7 +946,11 @@ function App() {
             )}
           </div>
 
-          <button className="account-button" title="Account">
+          <button
+            className="account-button"
+            title="Open Settings & Account"
+            onClick={() => setActivePage("settings")}
+          >
             <div className="avatar">S</div>
             {sidebarOpen && (
               <div className="account-copy">
@@ -789,9 +1021,23 @@ function App() {
                 </button>
               </div>
             )}
-            <span className="local-badge">
-              <span className="status-dot" />
-              Local
+            <span
+              className="local-badge"
+              title={
+                isCloudModel(selectedModel)
+                  ? "Connected to Groq Cloud (Free Tier)"
+                  : "100% Local Ollama Inference"
+              }
+            >
+              <span
+                className="status-dot"
+                style={
+                  isCloudModel(selectedModel)
+                    ? { background: "#fbbf24" }
+                    : undefined
+                }
+              />
+              {isCloudModel(selectedModel) ? "Cloud" : "Local"}
             </span>
           </div>
         </header>
@@ -799,7 +1045,11 @@ function App() {
         <ErrorBoundary key={activePage} fallbackTitle={pageTitles[activePage] || "Nexus View"}>
         {activePage === "chat" ? (
           <section className="chat-page">
-            <div className="chat-content">
+            <div
+              className="chat-content"
+              ref={chatContentRef}
+              onScroll={handleChatScroll}
+            >
               {messages.length === 0 ? (
                 <div className="welcome-content">
                   <h1>
@@ -814,8 +1064,22 @@ function App() {
                 </div>
               ) : (
                 <div className="message-list">
-                  {messages.map((item, index) => (
-                    <div className="user-message" key={item.id ?? `${item.role}-${index}`}>
+                  {hasOlderMessages && activeConversationId && (
+                    <div style={{ display: "flex", justifyContent: "center", marginBottom: "12px" }}>
+                      <button
+                        type="button"
+                        className="ws-secondary-btn"
+                        onClick={() => void handleLoadOlderMessages()}
+                        disabled={isLoadingOlderMessages || isGenerating}
+                      >
+                        {isLoadingOlderMessages ? "Loading older messages..." : "↑ Load older messages"}
+                      </button>
+                    </div>
+                  )}
+                  {messages.map((item, index) => {
+                    const messageKey = String(item.id ?? `${item.role}-${index}`);
+                    return (
+                    <div className="user-message" key={messageKey}>
                       <div className="message-avatar">
                         {item.role === "user" ? "S" : "N"}
                       </div>
@@ -843,22 +1107,32 @@ function App() {
                             </div>
                           )}
 
+                        {item.role === "assistant" &&
+                          index === messages.length - 1 &&
+                          liveWebSources.length > 0 && (
+                            <div className="retrieved-sources-pill" style={{ borderColor: "rgba(96, 165, 250, 0.4)" }}>
+                              <span className="source-tag" style={{ color: "#60a5fa" }}>
+                                🌐 Web Sources · {liveWebSources.map((s) => s.title).slice(0, 3).join(" · ")}
+                              </span>
+                            </div>
+                          )}
+
                         {item.role === "assistant" && item.content && !isGenerating && (
                           <div className="message-actions-row">
                             <button
                               type="button"
                               className={`save-memory-btn ${
-                                memorizedMessageIndices.has(index) ? "saved" : ""
+                                memorizedMessageKeys.has(messageKey) ? "saved" : ""
                               }`}
-                              onClick={() => void handleSaveToMemory(item.content, index)}
+                              onClick={() => void handleSaveToMemory(item.content, messageKey)}
                               disabled={
-                                memorizedMessageIndices.has(index) ||
-                                savingMemoryIndex === index
+                                memorizedMessageKeys.has(messageKey) ||
+                                savingMemoryKey === messageKey
                               }
                             >
-                              {memorizedMessageIndices.has(index)
+                              {memorizedMessageKeys.has(messageKey)
                                 ? "✓ Saved to Vault"
-                                : savingMemoryIndex === index
+                                : savingMemoryKey === messageKey
                                 ? "Saving..."
                                 : "⌘ Save to Memory"}
                             </button>
@@ -866,7 +1140,8 @@ function App() {
                         )}
                       </div>
                     </div>
-                  ))}
+                    );
+                  })}
 
                   {isGenerating && (
                     <div className="local-placeholder">
@@ -881,11 +1156,34 @@ function App() {
                       {generationError}
                     </div>
                   )}
+                  <div ref={chatBottomRef} />
                 </div>
               )}
             </div>
 
             <div className="composer-area">
+              {isSearchingWeb && (
+                <div className="web-search-status-banner">
+                  <span>🌐 Fetching live web results & current scores...</span>
+                </div>
+              )}
+              {!isSearchingWeb && webSearchNotice && (
+                <div
+                  className="web-search-status-banner"
+                  role="status"
+                  style={{ justifyContent: "space-between", gap: "12px" }}
+                >
+                  <span>{webSearchNotice}</span>
+                  <button
+                    type="button"
+                    className="feedback-dismiss"
+                    aria-label="Dismiss web search notice"
+                    onClick={() => setWebSearchNotice(null)}
+                  >
+                    ×
+                  </button>
+                </div>
+              )}
               <form className="composer" onSubmit={sendMessage}>
                 <textarea
                   value={message}
@@ -896,21 +1194,17 @@ function App() {
                       e.currentTarget.form?.requestSubmit();
                     }
                   }}
-                  placeholder="Message your AI..."
+                  placeholder={
+                    webSearchEnabled
+                      ? "Ask anything with live web access (e.g. today's F1 results, news, scores)..."
+                      : "Message your AI..."
+                  }
                   rows={2}
                   disabled={isGenerating}
                 />
 
                 <div className="composer-toolbar">
                   <div className="composer-tools">
-                    <button
-                      type="button"
-                      className="tool-button"
-                      title="Attach file"
-                    >
-                      ＋
-                    </button>
-
                     <button
                       type="button"
                       className={`memory-toggle ${memoraEnabled ? "on" : ""}`}
@@ -926,6 +1220,28 @@ function App() {
                       <span>Memory</span>
                     </button>
 
+                    <button
+                      type="button"
+                      className={`web-search-toggle ${webSearchEnabled && !workspaceStrictOffline ? "on" : ""}`}
+                      onClick={() => {
+                        if (!workspaceStrictOffline) {
+                          setWebSearchEnabled(!webSearchEnabled);
+                        }
+                      }}
+                      disabled={workspaceStrictOffline}
+                      aria-pressed={webSearchEnabled && !workspaceStrictOffline}
+                      title={
+                        workspaceStrictOffline
+                          ? "Strict Offline Mode is active for this workspace - web search is disabled"
+                          : webSearchEnabled
+                            ? "Live Web Search is ON - searches web for real-time news & scores"
+                            : "Live Web Search is OFF - click to enable real-time web access"
+                      }
+                    >
+                      <span className="web-search-dot" />
+                      <span>🌐 Web</span>
+                    </button>
+
                     <span className="tool-divider" />
                     <span className="model-label">MODEL</span>
 
@@ -937,21 +1253,54 @@ function App() {
                       aria-label="Select model"
                       disabled={isGenerating || busyModel !== null}
                     >
-                      {availableModels.length > 0 ? (
-                        availableModels.map((model) => (
-                          <option key={model.name} value={model.name}>
-                            {model.name}
-                          </option>
-                        ))
-                      ) : (
-                        <>
-                          <option value="qwen2.5-coder:7b">
-                            qwen2.5-coder:7b
-                          </option>
-                          <option value="qwen3:4b">qwen3:4b</option>
-                        </>
+                      <optgroup label="Local (Ollama 100% Offline)">
+                        {availableModels.length > 0 ? (
+                          availableModels.map((model) => (
+                            <option key={model.name} value={model.name}>
+                              💻 {model.name}
+                            </option>
+                          ))
+                        ) : (
+                          <>
+                            <option value="qwen2.5-coder:7b">
+                              💻 qwen2.5-coder:7b
+                            </option>
+                            <option value="qwen3:4b">💻 qwen3:4b</option>
+                          </>
+                        )}
+                      </optgroup>
+                      {!workspaceStrictOffline && (
+                        <optgroup label="Cloud (Groq Free - Live)">
+                          {cloudModels.length > 0 ? (
+                            cloudModels.map((cm) => (
+                              <option key={cm.id} value={cm.id}>
+                                ⚡ {cm.name}
+                              </option>
+                            ))
+                          ) : (
+                            <option disabled value="">
+                              Paste Groq key in Settings to load models
+                            </option>
+                          )}
+                        </optgroup>
                       )}
                     </select>
+
+                    {isCloudModel(selectedModel) ? (
+                      <span
+                        className="privacy-badge cloud"
+                        title="Connected to Groq Cloud (Free Tier) · Excerpts processed by Groq"
+                      >
+                        ⚡ Cloud (Groq Free)
+                      </span>
+                    ) : (
+                      <span
+                        className="privacy-badge local"
+                        title="100% Offline · Zero data leaves this machine"
+                      >
+                        🔒 100% Local
+                      </span>
+                    )}
                   </div>
 
                   {isGenerating ? (
@@ -990,10 +1339,11 @@ function App() {
               onOpenConversation={(conv) => {
                 void openConversation(conv);
               }}
-              onStartNewChat={() => {
-                startNewChat();
+              onStartNewChat={(prefillPrompt) => {
+                startNewChat(prefillPrompt);
               }}
               onBack={handleExitWorkspace}
+              onStrictOfflineChange={handleWorkspaceStrictOfflineChange}
             />
           ) : (
             <WorkspacesView

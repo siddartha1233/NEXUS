@@ -98,7 +98,8 @@ export async function streamOllamaChat(
   messages: ChatMessage[],
   onToken: (token: string) => void,
   signal?: AbortSignal,
-  onDone?: (metrics: GenerationMetrics) => void
+  onDone?: (metrics: GenerationMetrics) => void,
+  workspaceId?: string | null
 ): Promise<void> {
   if (signal?.aborted) {
     throw new DOMException("Generation aborted", "AbortError");
@@ -142,6 +143,7 @@ export async function streamOllamaChat(
     await invoke<void>("ollama_chat_stream", {
       model,
       messages,
+      workspaceId: workspaceId ?? null,
       onEvent,
     });
   } catch (error) {

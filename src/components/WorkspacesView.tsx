@@ -20,12 +20,14 @@ export function WorkspacesView({
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [createError, setCreateError] = useState<string | null>(null);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (!name.trim() || isSubmitting) return;
 
     setIsSubmitting(true);
+    setCreateError(null);
     try {
       await onCreateWorkspace(name.trim(), description.trim());
       setName("");
@@ -33,6 +35,7 @@ export function WorkspacesView({
       setShowCreateModal(false);
     } catch (err) {
       console.error("Failed to create workspace:", err);
+      setCreateError(err instanceof Error ? err.message : "Failed to create workspace.");
     } finally {
       setIsSubmitting(false);
     }
@@ -59,9 +62,26 @@ export function WorkspacesView({
       </div>
 
       {showCreateModal && (
-        <div className="ws-modal-backdrop">
-          <div className="ws-modal">
-            <h2>Create New Workspace</h2>
+        <div
+          className="ws-modal-backdrop"
+          onClick={() => {
+            if (!isSubmitting) setShowCreateModal(false);
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "Escape" && !isSubmitting) {
+              setShowCreateModal(false);
+            }
+          }}
+        >
+          <div
+            className="ws-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="ws-create-modal-title"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h2 id="ws-create-modal-title">Create New Workspace</h2>
+            {createError && <div className="mm-notice" style={{ marginBottom: "12px" }}>{createError}</div>}
             <form onSubmit={handleSubmit}>
               <div className="ws-form-group">
                 <label>Workspace Name</label>

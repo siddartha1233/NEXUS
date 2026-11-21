@@ -7,11 +7,17 @@ import {
   type OllamaModel,
   type RunningOllamaModel,
 } from "../services/ollama";
+import {
+  fetchLiveGroqModels,
+  isCloudModel,
+  type CloudModelInfo,
+} from "../services/cloudModels";
 
 export function useOllamaModels(isGenerating: boolean) {
   const [selectedModel, setSelectedModel] = useState("qwen2.5-coder:7b");
   const [allModels, setAllModels] = useState<OllamaModel[]>([]);
   const [runningModels, setRunningModels] = useState<RunningOllamaModel[]>([]);
+  const [cloudModels, setCloudModels] = useState<CloudModelInfo[]>([]);
   const [connectionStatus, setConnectionStatus] = useState<
     "checking" | "connected" | "disconnected"
   >("checking");
@@ -36,10 +42,29 @@ export function useOllamaModels(isGenerating: boolean) {
       setRunningModels(running);
       setConnectionStatus("connected");
 
+      // Also refresh live Groq models in the background
+      void fetchLiveGroqModels()
+        .then((live) => {
+          setCloudModels(live);
+          setSelectedModel((current) => {
+            if (isCloudModel(current)) {
+              if (!live.some((m) => m.id === current) && live.length > 0) {
+                return live[0].id;
+              }
+            }
+            return current;
+          });
+        })
+        .catch(() => {});
+
       const nextChatModels = models.filter((m) => !isEmbeddingModel(m.name));
       const list = nextChatModels.length > 0 ? nextChatModels : models;
 
       setSelectedModel((current) => {
+        // If current is a cloud model, keep it intact
+        if (isCloudModel(current)) {
+          return current;
+        }
         if (list.length > 0 && !list.some((m) => m.name === current)) {
           return list[0].name;
         }
@@ -48,6 +73,20 @@ export function useOllamaModels(isGenerating: boolean) {
     } catch (error) {
       setConnectionStatus("disconnected");
       setRunningModels([]);
+      // When Ollama is offline, still attempt to fetch cloud models so user can chat with cloud!
+      void fetchLiveGroqModels()
+        .then((live) => {
+          setCloudModels(live);
+          setSelectedModel((current) => {
+            if (isCloudModel(current)) {
+              if (!live.some((m) => m.id === current) && live.length > 0) {
+                return live[0].id;
+              }
+            }
+            return current;
+          });
+        })
+        .catch(() => {});
       setModelManagerError(
         error instanceof Error ? error.message : "Unable to connect to Ollama."
       );
@@ -64,6 +103,8 @@ export function useOllamaModels(isGenerating: boolean) {
       setModelManagerError("");
 
       try {
+        // If switching to a cloud model or another model, unload running local chat models
+        // to free up local GPU/VRAM
         const loadedChatModels = runningModels.filter(
           (m) => !isEmbeddingModel(m.name) && m.name !== newModel
         );
@@ -120,6 +161,16 @@ export function useOllamaModels(isGenerating: boolean) {
     [isGenerating]
   );
 
+  // Fallback to the first available local model (used during cloud rate limits or offline events)
+  const autoFallbackToLocal = useCallback((): string => {
+    const fallback =
+      availableModels[0]?.name ||
+      allModels[0]?.name ||
+      "qwen2.5-coder:7b";
+    setSelectedModel(fallback);
+    return fallback;
+  }, [allModels, availableModels]);
+
   return {
     selectedModel,
     setSelectedModel,
@@ -127,6 +178,7 @@ export function useOllamaModels(isGenerating: boolean) {
     runningModels,
     setRunningModels,
     availableModels,
+    cloudModels,
     connectionStatus,
     setConnectionStatus,
     isRefreshingModels,
@@ -135,5 +187,6 @@ export function useOllamaModels(isGenerating: boolean) {
     refreshOllamaState,
     handleSelectModel,
     handleUnloadModel,
+    autoFallbackToLocal,
   };
 }

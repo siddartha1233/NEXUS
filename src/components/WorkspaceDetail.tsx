@@ -13,14 +13,16 @@ import {
   type WorkspaceNote,
 } from "../services/workspaces";
 import { type Conversation } from "../services/conversations";
+import { getAppSetting, setAppSetting } from "../services/settings";
 
 interface WorkspaceDetailProps {
   workspace: Workspace;
   conversations: Conversation[];
   selectedModel: string;
   onOpenConversation: (conv: Conversation) => void;
-  onStartNewChat: () => void;
+  onStartNewChat: (prefillPrompt?: string) => void;
   onBack: () => void;
+  onStrictOfflineChange?: (isStrict: boolean) => void;
 }
 
 type TabType = "overview" | "chat" | "materials" | "notes" | "tools";
@@ -31,6 +33,7 @@ export function WorkspaceDetail({
   onOpenConversation,
   onStartNewChat,
   onBack,
+  onStrictOfflineChange,
 }: WorkspaceDetailProps) {
   const [activeTab, setActiveTab] = useState<TabType>("overview");
 
@@ -40,6 +43,8 @@ export function WorkspaceDetail({
   const [noteTitle, setNoteTitle] = useState("");
   const [noteContent, setNoteContent] = useState("");
   const [isSavingNote, setIsSavingNote] = useState(false);
+  const [noteSavedToast, setNoteSavedToast] = useState(false);
+  const [noteError, setNoteError] = useState<string | null>(null);
 
   // Materials state
   const [materials, setMaterials] = useState<WorkspaceMaterial[]>([]);
@@ -52,6 +57,28 @@ export function WorkspaceDetail({
   const [showAddMaterial, setShowAddMaterial] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  const [strictOffline, setStrictOffline] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    void getAppSetting(`ws_offline_${workspace.id}`).then((val) => {
+      if (!cancelled) setStrictOffline(val === "true");
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [workspace.id]);
+
+  const handleToggleStrictOffline = async (enabled: boolean) => {
+    setStrictOffline(enabled);
+    try {
+      await setAppSetting(`ws_offline_${workspace.id}`, enabled ? "true" : "false");
+      onStrictOfflineChange?.(enabled);
+    } catch (err) {
+      setStrictOffline(!enabled);
+      console.error("Failed to update workspace strict offline:", err);
+    }
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -107,6 +134,7 @@ export function WorkspaceDetail({
   async function handleSaveNote() {
     if (!noteTitle.trim() && !noteContent.trim()) return;
     setIsSavingNote(true);
+    setNoteError(null);
     try {
       const saved = await saveWorkspaceNote(
         workspace.id,
@@ -125,14 +153,19 @@ export function WorkspaceDetail({
         return [saved, ...prev];
       });
       setActiveNoteId(saved.id);
+      setNoteSavedToast(true);
+      setTimeout(() => setNoteSavedToast(false), 2000);
     } catch (err) {
       console.error("Failed to save note:", err);
+      setNoteError(err instanceof Error ? err.message : "Failed to save note.");
     } finally {
       setIsSavingNote(false);
     }
   }
 
   async function handleDeleteNote(noteId: string) {
+    if (!window.confirm("Delete this workspace note permanently?")) return;
+    setNoteError(null);
     try {
       await deleteWorkspaceNote(workspace.id, noteId);
       const remaining = notes.filter((n) => n.id !== noteId);
@@ -146,6 +179,7 @@ export function WorkspaceDetail({
       }
     } catch (err) {
       console.error("Failed to delete note:", err);
+      setNoteError(err instanceof Error ? err.message : "Failed to delete note.");
     }
   }
 
@@ -203,11 +237,18 @@ export function WorkspaceDetail({
   }
 
   async function handleDeleteMaterial(matId: string) {
+    if (!window.confirm("Delete this workspace material and its stored file permanently?")) {
+      return;
+    }
+    setUploadError(null);
     try {
       await deleteWorkspaceMaterial(workspace.id, matId);
       setMaterials((prev) => prev.filter((m) => m.id !== matId));
     } catch (err) {
       console.error("Failed to delete material:", err);
+      setUploadError(
+        err instanceof Error ? err.message : "Failed to delete workspace material."
+      );
     }
   }
 
@@ -316,13 +357,27 @@ export function WorkspaceDetail({
             </div>
 
             <div className="ws-section-box">
-              <h3>Workspace Isolation Policy</h3>
-              <p>
-                All conversations, notes, and study materials in this workspace
-                are strictly isolated. AI queries executed in General Chat or
-                other workspaces will never access or retrieve content from this
-                workspace without explicit user permission.
-              </p>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "1.5rem" }}>
+                <div>
+                  <h3>Workspace Isolation & Privacy Policy</h3>
+                  <p>
+                    All conversations, notes, and study materials in this workspace
+                    are strictly isolated. AI queries in General Chat will never access
+                    this workspace.
+                  </p>
+                </div>
+                <label style={{ display: "flex", alignItems: "center", gap: "0.5rem", cursor: "pointer", whiteSpace: "nowrap" }}>
+                  <input
+                    type="checkbox"
+                    checked={strictOffline}
+                    onChange={(e) => void handleToggleStrictOffline(e.target.checked)}
+                    style={{ width: "16px", height: "16px", cursor: "pointer" }}
+                  />
+                  <span style={{ fontSize: "0.85rem", fontWeight: 600, color: strictOffline ? "#34d399" : "var(--text-secondary)" }}>
+                    {strictOffline ? "🔒 Strict Offline (Cloud Blocked)" : "⚡ Cloud Models Allowed"}
+                  </span>
+                </label>
+              </div>
             </div>
           </div>
         )}
@@ -335,7 +390,7 @@ export function WorkspaceDetail({
               <button
                 type="button"
                 className="ws-primary-btn"
-                onClick={onStartNewChat}
+                onClick={() => onStartNewChat()}
               >
                 ＋ New Workspace Chat
               </button>
@@ -622,6 +677,11 @@ export function WorkspaceDetail({
             </div>
 
             <div className="ws-note-editor">
+              {noteError && (
+                <div className="mm-notice" style={{ marginBottom: "10px" }}>
+                  {noteError}
+                </div>
+              )}
               <div className="ws-note-editor-toolbar">
                 <input
                   type="text"
@@ -636,7 +696,11 @@ export function WorkspaceDetail({
                   onClick={() => void handleSaveNote()}
                   disabled={isSavingNote}
                 >
-                  {isSavingNote ? "Saving..." : "Save Note"}
+                  {isSavingNote
+                    ? "Saving..."
+                    : noteSavedToast
+                      ? "✓ Saved"
+                      : "Save Note"}
                 </button>
               </div>
 
@@ -654,31 +718,55 @@ export function WorkspaceDetail({
         {activeTab === "tools" && (
           <div className="ws-tools-section">
             <div className="ws-tools-grid">
-              <div className="ws-tool-card">
+              <div
+                className="ws-tool-card"
+                style={{ cursor: "pointer" }}
+                onClick={() =>
+                  onStartNewChat(
+                    `Generate a 5-question practice quiz with answer explanations based on the study materials in ${workspace.name}.`
+                  )
+                }
+              >
                 <h4>Quiz Generator</h4>
                 <p>
                   Generate practice questions and flashcards directly from this
                   workspace's notes and materials.
                 </p>
-                <span className="ws-tool-tag">Phase 5 (Knowledge Engine)</span>
+                <span className="ws-tool-tag">Launch Quiz Prompt →</span>
               </div>
 
-              <div className="ws-tool-card">
+              <div
+                className="ws-tool-card"
+                style={{ cursor: "pointer" }}
+                onClick={() =>
+                  onStartNewChat(
+                    `Create a structured concept summary and key-takeaways study guide from the uploaded materials in ${workspace.name}.`
+                  )
+                }
+              >
                 <h4>Concept Summarizer</h4>
                 <p>
                   Create high-level study guides and cheat sheets grounded in
                   lecture materials.
                 </p>
-                <span className="ws-tool-tag">Phase 5 (Knowledge Engine)</span>
+                <span className="ws-tool-tag">Launch Summary Prompt →</span>
               </div>
 
-              <div className="ws-tool-card">
+              <div
+                className="ws-tool-card"
+                style={{ cursor: "pointer" }}
+                onClick={() =>
+                  onStartNewChat(
+                    `What are the core topics covered in ${workspace.name}? Cite the exact lecture or assignment filenames.`
+                  )
+                }
+              >
                 <h4>Source Grounded Q&A</h4>
                 <p>
                   Ask questions with strict citations referencing specific lecture
                   slides or assignment briefs.
                 </p>
-                <span className="ws-tool-tag">Phase 5 (Knowledge Engine)</span>
+                <span className="ws-tool-tag">Launch Grounded Q&A →</span>
               </div>
             </div>
           </div>

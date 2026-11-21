@@ -1,7 +1,9 @@
+mod cloud_llm;
 mod code_runner;
 mod db;
 mod memora;
 mod ollama;
+mod web_search;
 
 use tauri::Manager;
 
@@ -57,8 +59,17 @@ pub fn run() {
             db::db_export_conversation_json,
             db::db_reset_sandbox,
             db::db_record_telemetry,
-            db::db_get_telemetry_stats
+            db::db_get_telemetry_stats,
+            db::db_get_setting,
+            db::db_set_setting,
+            ollama::groq_get_active_models,
+            web_search::web_search
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app_handle, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                memora::reset_warm_worker();
+            }
+        });
 }

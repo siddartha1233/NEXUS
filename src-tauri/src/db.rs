@@ -1,16 +1,17 @@
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::State;
 
 static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 pub struct DbState {
-    pub conn: Mutex<Connection>,
+    pub conn: Arc<Mutex<Connection>>,
+    pub read_conn: Arc<Mutex<Connection>>,
     pub app_data_dir: PathBuf,
 }
 
@@ -221,6 +222,12 @@ fn ensure_schema(conn: &Connection) -> Result<(), String> {
             AFTER DELETE ON workspace_materials BEGIN
                 DELETE FROM workspace_materials_fts WHERE material_id = old.id;
             END;
+
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
             ",
         )
         .map_err(|e| format!("Failed to initialize database schema: {e}"))?;
@@ -240,6 +247,14 @@ fn ensure_schema(conn: &Connection) -> Result<(), String> {
         Ok(())
 }
 
+fn open_readonly_connection(db_path: &std::path::Path) -> Result<Connection, String> {
+    let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| format!("Failed to open read-only SQLite connection: {e}"))?;
+    let _ = conn.busy_timeout(Duration::from_secs(5));
+    let _ = conn.execute_batch("PRAGMA query_only = ON;");
+    Ok(conn)
+}
+
 impl DbState {
     pub fn initialize(app_data_dir: PathBuf) -> Result<Self, String> {
         fs::create_dir_all(&app_data_dir)
@@ -248,11 +263,14 @@ impl DbState {
         let db_path = app_data_dir.join("nexus.db");
         let conn = Connection::open(&db_path)
             .map_err(|e| format!("Failed to open SQLite database: {e}"))?;
+        let _ = conn.busy_timeout(Duration::from_secs(5));
 
         ensure_schema(&conn)?;
+        let read_conn = open_readonly_connection(&db_path)?;
 
         Ok(Self {
-            conn: Mutex::new(conn),
+            conn: Arc::new(Mutex::new(conn)),
+            read_conn: Arc::new(Mutex::new(read_conn)),
             app_data_dir,
         })
     }
@@ -263,9 +281,9 @@ impl DbState {
 #[tauri::command]
 pub fn db_list_workspaces(state: State<'_, DbState>) -> Result<Vec<Workspace>, String> {
     let conn = state
-        .conn
+        .read_conn
         .lock()
-        .map_err(|_| "Database lock poisoned".to_string())?;
+        .map_err(|_| "Database read lock poisoned".to_string())?;
 
     let mut stmt = conn
         .prepare(
@@ -379,6 +397,8 @@ pub fn db_delete_workspace(state: State<'_, DbState>, id: String) -> Result<(), 
 
         conn.execute("DELETE FROM workspaces WHERE id = ?1", params![id])
             .map_err(|e| format!("Failed to delete workspace: {e}"))?;
+        let offline_key = format!("ws_offline_{id}");
+        let _ = conn.execute("DELETE FROM app_settings WHERE key = ?1", params![offline_key]);
     }
 
     let ws_dir = state.app_data_dir.join("workspaces").join(&id);
@@ -397,9 +417,9 @@ pub fn db_list_conversations(
     workspace_id: Option<String>,
 ) -> Result<Vec<Conversation>, String> {
     let conn = state
-        .conn
+        .read_conn
         .lock()
-        .map_err(|_| "Database lock poisoned".to_string())?;
+        .map_err(|_| "Database read lock poisoned".to_string())?;
 
     let mut conversations = Vec::new();
 
@@ -537,45 +557,89 @@ pub fn db_delete_conversation(state: State<'_, DbState>, id: String) -> Result<(
     Ok(())
 }
 
+fn fetch_messages_page(
+    conn: &Connection,
+    conversation_id: &str,
+    before_id: Option<i64>,
+    limit: i64,
+) -> Result<Vec<StoredMessage>, String> {
+    let clamped_limit = limit.clamp(1, 500);
+    let mut messages = Vec::new();
+
+    if let Some(cursor_id) = before_id {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, conversation_id, role, content, model, created_at
+                 FROM messages
+                 WHERE conversation_id = ?1 AND id < ?2
+                 ORDER BY id DESC
+                 LIMIT ?3",
+            )
+            .map_err(|e| format!("Failed to prepare paginated messages query: {e}"))?;
+
+        let rows = stmt
+            .query_map(params![conversation_id, cursor_id, clamped_limit], |row| {
+                Ok(StoredMessage {
+                    id: row.get(0)?,
+                    conversation_id: row.get(1)?,
+                    role: row.get(2)?,
+                    content: row.get(3)?,
+                    model: row.get(4)?,
+                    created_at: row.get(5)?,
+                })
+            })
+            .map_err(|e| format!("Failed to query messages: {e}"))?;
+
+        for row in rows {
+            messages.push(row.map_err(|e| format!("Failed to read message row: {e}"))?);
+        }
+    } else {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, conversation_id, role, content, model, created_at
+                 FROM messages
+                 WHERE conversation_id = ?1
+                 ORDER BY id DESC
+                 LIMIT ?2",
+            )
+            .map_err(|e| format!("Failed to prepare messages query: {e}"))?;
+
+        let rows = stmt
+            .query_map(params![conversation_id, clamped_limit], |row| {
+                Ok(StoredMessage {
+                    id: row.get(0)?,
+                    conversation_id: row.get(1)?,
+                    role: row.get(2)?,
+                    content: row.get(3)?,
+                    model: row.get(4)?,
+                    created_at: row.get(5)?,
+                })
+            })
+            .map_err(|e| format!("Failed to query messages: {e}"))?;
+
+        for row in rows {
+            messages.push(row.map_err(|e| format!("Failed to read message row: {e}"))?);
+        }
+    }
+
+    // Reverse newest-first slice back to chronological order for display
+    messages.reverse();
+    Ok(messages)
+}
+
 #[tauri::command]
 pub fn db_get_messages(
     state: State<'_, DbState>,
     conversation_id: String,
+    before_id: Option<i64>,
+    limit: Option<i64>,
 ) -> Result<Vec<StoredMessage>, String> {
     let conn = state
-        .conn
+        .read_conn
         .lock()
-        .map_err(|_| "Database lock poisoned".to_string())?;
+        .map_err(|_| "Database read lock poisoned".to_string())?;
 
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, conversation_id, role, content, model, created_at
-             FROM messages
-             WHERE conversation_id = ?1
-             ORDER BY id ASC
-             LIMIT 500",
-        )
-        .map_err(|e| format!("Failed to prepare messages query: {e}"))?;
-
-    let rows = stmt
-        .query_map(params![conversation_id], |row| {
-            Ok(StoredMessage {
-                id: row.get(0)?,
-                conversation_id: row.get(1)?,
-                role: row.get(2)?,
-                content: row.get(3)?,
-                model: row.get(4)?,
-                created_at: row.get(5)?,
-            })
-        })
-        .map_err(|e| format!("Failed to query messages: {e}"))?;
-
-    let mut messages = Vec::new();
-    for row in rows {
-        messages.push(row.map_err(|e| format!("Failed to read message row: {e}"))?);
-    }
-
-    Ok(messages)
+    fetch_messages_page(&conn, &conversation_id, before_id, limit.unwrap_or(500))
 }
 
 #[tauri::command]
@@ -634,9 +698,9 @@ pub fn db_list_workspace_notes(
     workspace_id: String,
 ) -> Result<Vec<WorkspaceNote>, String> {
     let conn = state
-        .conn
+        .read_conn
         .lock()
-        .map_err(|_| "Database lock poisoned".to_string())?;
+        .map_err(|_| "Database read lock poisoned".to_string())?;
 
     let mut stmt = conn
         .prepare(
@@ -754,9 +818,9 @@ pub fn db_list_workspace_materials(
     workspace_id: String,
 ) -> Result<Vec<WorkspaceMaterial>, String> {
     let conn = state
-        .conn
+        .read_conn
         .lock()
-        .map_err(|_| "Database lock poisoned".to_string())?;
+        .map_err(|_| "Database read lock poisoned".to_string())?;
 
     let mut stmt = conn
         .prepare(
@@ -830,6 +894,8 @@ pub fn db_add_workspace_material(
     })
 }
 
+const MAX_IMPORT_FILE_BYTES: u64 = 32 * 1024 * 1024;
+
 #[tauri::command]
 pub async fn db_import_workspace_file(
     state: State<'_, DbState>,
@@ -842,6 +908,15 @@ pub async fn db_import_workspace_file(
 
     if !src.is_file() {
         return Err("Source file does not exist or is not a regular file.".to_string());
+    }
+
+    let meta = fs::metadata(&src)
+        .map_err(|e| format!("Unable to inspect source file metadata: {e}"))?;
+    if meta.len() > MAX_IMPORT_FILE_BYTES {
+        return Err(format!(
+            "File exceeds the maximum allowed import size ({} MB).",
+            MAX_IMPORT_FILE_BYTES / (1024 * 1024)
+        ));
     }
 
     // Verify workspace exists before writing to disk
@@ -868,7 +943,8 @@ pub async fn db_import_workspace_file(
     let mat_id_clone = mat_id.clone();
 
     // Offload file copy and PDF/text extraction off the main command thread without holding DB lock
-    let (filename, title, preview) = tokio::task::spawn_blocking(move || -> Result<(String, String, String), String> {
+    let (filename, title, preview, target_file) = tokio::task::spawn_blocking(
+        move || -> Result<(String, String, String, PathBuf), String> {
         let filename = src
             .file_name()
             .map(|f| f.to_string_lossy().to_string())
@@ -899,10 +975,10 @@ pub async fn db_import_workspace_file(
                 fs::File::open(&target_file)
                     .map(|file| {
                         let mut buf = Vec::new();
-                        let _ = file.take(64 * 1024).read_to_end(&mut buf);
+                        let _ = file.take(256 * 1024).read_to_end(&mut buf);
                         let text = String::from_utf8_lossy(&buf);
-                        let truncated: String = text.chars().take(1500).collect();
-                        if text.chars().count() > 1500 {
+                        let truncated: String = text.chars().take(16000).collect();
+                        if text.chars().count() > 16000 {
                             format!("{truncated}...")
                         } else {
                             truncated
@@ -914,7 +990,7 @@ pub async fn db_import_workspace_file(
                 Ok(doc) => {
                     let mut text = String::new();
                     let pages = doc.get_pages();
-                    for (&page_num, _) in pages.iter().take(3) {
+                    for (&page_num, _) in pages.iter().take(25) {
                         if let Ok(page_text) = doc.extract_text(&[page_num]) {
                             text.push_str(&page_text);
                             text.push('\n');
@@ -923,8 +999,8 @@ pub async fn db_import_workspace_file(
                     if text.trim().is_empty() {
                         "PDF uploaded (visual/scanned PDF - text extraction will require OCR in indexing).".to_string()
                     } else {
-                        let truncated: String = text.chars().take(1500).collect();
-                        if text.chars().count() > 1500 {
+                        let truncated: String = text.chars().take(16000).collect();
+                        if text.chars().count() > 16000 {
                             format!("{truncated}...")
                         } else {
                             truncated
@@ -941,8 +1017,9 @@ pub async fn db_import_workspace_file(
             .map(|(base, _)| base.replace(['_', '-'], " "))
             .unwrap_or_else(|| filename.clone());
 
-        Ok((filename, title, preview))
-    })
+        Ok((filename, title, preview, target_file))
+    },
+    )
     .await
     .map_err(|e| format!("File import worker panicked: {e}"))??;
 
@@ -952,12 +1029,15 @@ pub async fn db_import_workspace_file(
         .lock()
         .map_err(|_| "Database lock poisoned".to_string())?;
 
-    conn.execute(
+    if let Err(e) = conn.execute(
         "INSERT INTO workspace_materials (id, workspace_id, category, title, filename, content_preview, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![mat_id, workspace_id, category, title, filename, preview, now],
-    )
-    .map_err(|e| format!("Failed to add material: {e}"))?;
+    ) {
+        // Clean up copied file if database registration fails (e.g. workspace concurrently deleted)
+        let _ = fs::remove_file(&target_file);
+        return Err(format!("Failed to add material: {e}"));
+    }
 
     Ok(WorkspaceMaterial {
         id: mat_id,
@@ -993,9 +1073,9 @@ pub fn db_get_workspace_context(
     }
 
     let conn = state
-        .conn
+        .read_conn
         .lock()
-        .map_err(|_| "Database lock poisoned".to_string())?;
+        .map_err(|_| "Database read lock poisoned".to_string())?;
 
     let mut matched_sections = Vec::new();
     let mut sources = Vec::new();
@@ -1192,9 +1272,9 @@ pub struct PlatformStats {
 #[tauri::command]
 pub fn db_get_platform_stats(state: State<'_, DbState>) -> Result<PlatformStats, String> {
     let conn = state
-        .conn
+        .read_conn
         .lock()
-        .map_err(|_| "Database lock poisoned".to_string())?;
+        .map_err(|_| "Database read lock poisoned".to_string())?;
 
     let total_conversations: i64 = conn
         .query_row("SELECT count(*) FROM conversations", [], |r| r.get(0))
@@ -1232,8 +1312,26 @@ pub fn db_get_platform_stats(state: State<'_, DbState>) -> Result<PlatformStats,
     })
 }
 
+fn scrub_backup_secrets(backup_path: &std::path::Path) -> Result<(), String> {
+    if !backup_path.is_file() {
+        return Err("Backup file missing before secret scrubbing.".to_string());
+    }
+    let backup_conn = Connection::open(backup_path)
+        .map_err(|e| format!("Failed to open backup snapshot for secret scrubbing: {e}"))?;
+    backup_conn
+        .execute(
+            "DELETE FROM app_settings WHERE key = 'groq_api_key' OR key LIKE '%_api_key%'",
+            [],
+        )
+        .map_err(|e| format!("Failed to scrub API keys from backup snapshot: {e}"))?;
+    Ok(())
+}
+
 #[tauri::command]
-pub fn db_export_backup(state: State<'_, DbState>, destination_path: String) -> Result<String, String> {
+pub async fn db_export_backup(
+    state: State<'_, DbState>,
+    destination_path: String,
+) -> Result<String, String> {
     let dest = validate_file_path(&destination_path, &["sqlite", "db", "bak"])?;
 
     let active_db = state.app_data_dir.join("nexus.db");
@@ -1246,100 +1344,158 @@ pub fn db_export_backup(state: State<'_, DbState>, destination_path: String) -> 
         }
     }
 
-    let conn = state
-        .conn
-        .lock()
-        .map_err(|_| "Database lock poisoned".to_string())?;
-
-    if dest.is_file() {
-        let _ = fs::remove_file(&dest);
-    }
-
     let dest_str = dest.to_string_lossy().to_string();
-    conn.execute("VACUUM INTO ?1", params![dest_str])
-        .map_err(|e| format!("VACUUM backup failed: {e}"))?;
+    let active_db_for_worker = active_db.clone();
+    let dest_for_worker = dest.clone();
+    let dest_str_for_worker = dest_str.clone();
+
+    // Use a dedicated short-lived WAL snapshot connection so VACUUM INTO never blocks main DB mutex reads/writes
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        {
+            let snapshot_conn = Connection::open(&active_db_for_worker)
+                .map_err(|e| format!("Failed to open database snapshot connection: {e}"))?;
+            let _ = snapshot_conn.busy_timeout(std::time::Duration::from_secs(5));
+
+            if dest_for_worker.is_file() {
+                fs::remove_file(&dest_for_worker)
+                    .map_err(|e| format!("Failed to replace existing backup file: {e}"))?;
+            }
+
+            snapshot_conn
+                .execute("VACUUM INTO ?1", params![dest_str_for_worker])
+                .map_err(|e| format!("VACUUM backup failed: {e}"))?;
+        }
+
+        // Fail closed: remove the backup snapshot if API key scrubbing fails
+        if let Err(scrub_err) = scrub_backup_secrets(&dest_for_worker) {
+            let _ = fs::remove_file(&dest_for_worker);
+            return Err(format!(
+                "Backup aborted because secret scrubbing failed ({scrub_err})."
+            ));
+        }
+
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("Backup worker panicked: {e}"))??;
 
     Ok(dest_str)
 }
 
 #[tauri::command]
-pub fn db_restore_backup(state: State<'_, DbState>, source_path: String) -> Result<String, String> {
+pub async fn db_restore_backup(
+    state: State<'_, DbState>,
+    source_path: String,
+) -> Result<String, String> {
     let src = validate_file_path(&source_path, &["sqlite", "db", "bak"])?;
     if !src.is_file() {
         return Err("Selected backup file does not exist.".to_string());
     }
 
-    let mut conn = state
-        .conn
-        .lock()
-        .map_err(|_| "Database lock poisoned".to_string())?;
-
-    {
-        let test_conn = Connection::open(&src)
-            .map_err(|e| format!("Invalid SQLite backup file: {e}"))?;
-        let _test: i64 = test_conn
-            .query_row("SELECT count(*) FROM conversations", [], |r| r.get(0))
-            .map_err(|e| format!("Backup file is missing Nexus tables: {e}"))?;
+    let active_db = state.app_data_dir.join("nexus.db");
+    if src == active_db {
+        return Err("Cannot restore directly from the active database file.".to_string());
     }
-
-    let db_path = state.app_data_dir.join("nexus.db");
-    let safety_backup_path = state.app_data_dir.join("nexus.db.pre_restore.bak");
-    let wal_path = state.app_data_dir.join("nexus.db-wal");
-    let shm_path = state.app_data_dir.join("nexus.db-shm");
-
-    // Flush any pending WAL frames before releasing the connection
-    let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
-
-    *conn = Connection::open_in_memory().map_err(|e| format!("Error releasing database: {e}"))?;
-
-    // Remove stale WAL/SHM sidecar files so the restored DB does not replay old journal frames
-    if wal_path.exists() {
-        let _ = fs::remove_file(&wal_path);
-    }
-    if shm_path.exists() {
-        let _ = fs::remove_file(&shm_path);
-    }
-
-    // Move existing database to a safety rollback file before overwriting
-    let had_existing = db_path.exists();
-    if had_existing {
-        if safety_backup_path.exists() {
-            let _ = fs::remove_file(&safety_backup_path);
+    if let (Ok(canon_src), Ok(canon_active)) = (fs::canonicalize(&src), fs::canonicalize(&active_db)) {
+        if canon_src == canon_active {
+            return Err("Cannot restore directly from the active database file.".to_string());
         }
-        fs::rename(&db_path, &safety_backup_path)
-            .map_err(|e| format!("Failed to stage pre-restore safety backup: {e}"))?;
     }
 
-    let restore_result: Result<Connection, String> = (|| {
-        fs::copy(&src, &db_path)
-            .map_err(|e| format!("Failed to restore database file: {e}"))?;
-        let new_conn = Connection::open(&db_path)
-            .map_err(|e| format!("Failed to reopen restored database: {e}"))?;
-        ensure_schema(&new_conn)?;
-        Ok(new_conn)
-    })();
+    let conn_arc = Arc::clone(&state.conn);
+    let read_conn_arc = Arc::clone(&state.read_conn);
+    let app_data_dir = state.app_data_dir.clone();
 
-    match restore_result {
-        Ok(new_conn) => {
-            *conn = new_conn;
+    tokio::task::spawn_blocking(move || -> Result<String, String> {
+        let mut conn = conn_arc
+            .lock()
+            .map_err(|_| "Database lock poisoned".to_string())?;
+        let mut read_conn = read_conn_arc
+            .lock()
+            .map_err(|_| "Database read lock poisoned".to_string())?;
+
+        {
+            let test_conn = Connection::open(&src)
+                .map_err(|e| format!("Invalid SQLite backup file: {e}"))?;
+            let _test: i64 = test_conn
+                .query_row("SELECT count(*) FROM conversations", [], |r| r.get(0))
+                .map_err(|e| format!("Backup file is missing Nexus tables: {e}"))?;
+        }
+
+        let db_path = app_data_dir.join("nexus.db");
+        let safety_backup_path = app_data_dir.join("nexus.db.pre_restore.bak");
+        let wal_path = app_data_dir.join("nexus.db-wal");
+        let shm_path = app_data_dir.join("nexus.db-shm");
+
+        // Release read-only handle first so Windows file locks are cleared before checkpoint & rename
+        *read_conn = Connection::open_in_memory()
+            .map_err(|e| format!("Error releasing read connection: {e}"))?;
+
+        // Flush any pending WAL frames before releasing the writer connection
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+
+        *conn = Connection::open_in_memory()
+            .map_err(|e| format!("Error releasing database: {e}"))?;
+
+        // Remove stale WAL/SHM sidecar files so the restored DB does not replay old journal frames
+        if wal_path.exists() {
+            let _ = fs::remove_file(&wal_path);
+        }
+        if shm_path.exists() {
+            let _ = fs::remove_file(&shm_path);
+        }
+
+        // Move existing database to a safety rollback file before overwriting
+        let had_existing = db_path.exists();
+        if had_existing {
             if safety_backup_path.exists() {
                 let _ = fs::remove_file(&safety_backup_path);
             }
-            Ok("Database restored successfully.".to_string())
+            fs::rename(&db_path, &safety_backup_path)
+                .map_err(|e| format!("Failed to stage pre-restore safety backup: {e}"))?;
         }
-        Err(err_msg) => {
-            // Roll back to pre-restore safety copy if anything failed
-            if had_existing && safety_backup_path.exists() {
-                let _ = fs::remove_file(&db_path);
-                let _ = fs::rename(&safety_backup_path, &db_path);
-                if let Ok(reopened) = Connection::open(&db_path) {
-                    let _ = reopened.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;");
-                    *conn = reopened;
+
+        let restore_result: Result<(Connection, Connection), String> = (|| {
+            fs::copy(&src, &db_path)
+                .map_err(|e| format!("Failed to restore database file: {e}"))?;
+            let new_conn = Connection::open(&db_path)
+                .map_err(|e| format!("Failed to reopen restored database: {e}"))?;
+            let _ = new_conn.busy_timeout(Duration::from_secs(5));
+            ensure_schema(&new_conn)?;
+            let new_read_conn = open_readonly_connection(&db_path)?;
+            Ok((new_conn, new_read_conn))
+        })();
+
+        match restore_result {
+            Ok((new_conn, new_read_conn)) => {
+                *conn = new_conn;
+                *read_conn = new_read_conn;
+                if safety_backup_path.exists() {
+                    let _ = fs::remove_file(&safety_backup_path);
                 }
+                Ok("Database restored successfully.".to_string())
             }
-            Err(err_msg)
+            Err(err_msg) => {
+                // Roll back to pre-restore safety copy if anything failed
+                if had_existing && safety_backup_path.exists() {
+                    let _ = fs::remove_file(&db_path);
+                    let _ = fs::rename(&safety_backup_path, &db_path);
+                    if let Ok(reopened) = Connection::open(&db_path) {
+                        let _ = reopened.busy_timeout(Duration::from_secs(5));
+                        let _ = reopened
+                            .execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;");
+                        *conn = reopened;
+                        if let Ok(reopened_read) = open_readonly_connection(&db_path) {
+                            *read_conn = reopened_read;
+                        }
+                    }
+                }
+                Err(err_msg)
+            }
         }
-    }
+    })
+    .await
+    .map_err(|e| format!("Database restore worker panicked: {e}"))?
 }
 
 #[derive(Serialize)]
@@ -1353,136 +1509,173 @@ struct ExportJsonPayload<'a> {
 }
 
 #[tauri::command]
-pub fn db_export_conversation_markdown(
+pub async fn db_export_conversation_markdown(
     state: State<'_, DbState>,
     conversation_id: String,
     destination_path: String,
 ) -> Result<(), String> {
     let dest = validate_file_path(&destination_path, &["md", "markdown"])?;
-    let conn = state
-        .conn
-        .lock()
-        .map_err(|_| "Database lock poisoned".to_string())?;
+    let (title, model, created_at, msgs) = {
+        let conn = state
+            .conn
+            .lock()
+            .map_err(|_| "Database lock poisoned".to_string())?;
 
-    let (title, model, created_at): (String, String, i64) = conn
-        .query_row(
-            "SELECT title, model, created_at FROM conversations WHERE id = ?1",
-            params![conversation_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .map_err(|e| format!("Conversation not found: {e}"))?;
+        let (title, model, created_at): (String, String, i64) = conn
+            .query_row(
+                "SELECT title, model, created_at FROM conversations WHERE id = ?1",
+                params![conversation_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .map_err(|e| format!("Conversation not found: {e}"))?;
 
-    let mut stmt = conn
-        .prepare("SELECT id, conversation_id, role, content, model, created_at FROM messages WHERE conversation_id = ?1 ORDER BY id ASC")
-        .map_err(|e| format!("Query error: {e}"))?;
+        let mut stmt = conn
+            .prepare("SELECT id, conversation_id, role, content, model, created_at FROM messages WHERE conversation_id = ?1 ORDER BY id ASC")
+            .map_err(|e| format!("Query error: {e}"))?;
 
-    let msgs: Vec<StoredMessage> = stmt
-        .query_map(params![conversation_id], |row| {
-            Ok(StoredMessage {
-                id: row.get(0)?,
-                conversation_id: row.get(1)?,
-                role: row.get(2)?,
-                content: row.get(3)?,
-                model: row.get(4)?,
-                created_at: row.get(5)?,
+        let msgs: Vec<StoredMessage> = stmt
+            .query_map(params![conversation_id], |row| {
+                Ok(StoredMessage {
+                    id: row.get(0)?,
+                    conversation_id: row.get(1)?,
+                    role: row.get(2)?,
+                    content: row.get(3)?,
+                    model: row.get(4)?,
+                    created_at: row.get(5)?,
+                })
             })
-        })
-        .map_err(|e| format!("Failed to map messages: {e}"))?
-        .filter_map(Result::ok)
-        .collect();
+            .map_err(|e| format!("Failed to map messages: {e}"))?
+            .filter_map(Result::ok)
+            .collect();
 
-    let mut md = String::new();
-    md.push_str(&format!("# {}\n\n", title));
-    md.push_str(&format!("- **Model:** {}\n", model));
-    md.push_str(&format!("- **Created Timestamp:** {}\n", created_at));
-    md.push_str(&format!("- **Exported from:** Nexus AI Platform\n\n---\n\n"));
+        (title, model, created_at, msgs)
+    };
 
-    for msg in msgs {
-        let speaker = if msg.role == "user" {
-            "### You".to_string()
-        } else {
-            format!("### Nexus ({})", msg.model.unwrap_or_else(|| model.clone()))
-        };
+    // Format and write file off the main thread after releasing the DB lock
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let mut md = String::new();
+        md.push_str(&format!("# {}\n\n", title));
+        md.push_str(&format!("- **Model:** {}\n", model));
+        md.push_str(&format!("- **Created Timestamp:** {}\n", created_at));
+        md.push_str("- **Exported from:** Nexus AI Platform\n\n---\n\n");
 
-        md.push_str(&format!("{}\n\n{}\n\n---\n\n", speaker, msg.content.trim()));
-    }
+        for msg in msgs {
+            let speaker = if msg.role == "user" {
+                "### You".to_string()
+            } else {
+                format!("### Nexus ({})", msg.model.unwrap_or_else(|| model.clone()))
+            };
 
-    fs::write(&dest, md)
-        .map_err(|e| format!("Failed to write export file: {e}"))?;
+            md.push_str(&format!("{}\n\n{}\n\n---\n\n", speaker, msg.content.trim()));
+        }
+
+        fs::write(&dest, md)
+            .map_err(|e| format!("Failed to write export file: {e}"))?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("Markdown export worker panicked: {e}"))??;
 
     Ok(())
 }
 
 #[tauri::command]
-pub fn db_export_conversation_json(
+pub async fn db_export_conversation_json(
     state: State<'_, DbState>,
     conversation_id: String,
     destination_path: String,
 ) -> Result<(), String> {
     let dest = validate_file_path(&destination_path, &["json"])?;
-    let conn = state
-        .conn
-        .lock()
-        .map_err(|_| "Database lock poisoned".to_string())?;
+    let (title, model, created_at, msgs) = {
+        let conn = state
+            .conn
+            .lock()
+            .map_err(|_| "Database lock poisoned".to_string())?;
 
-    let (title, model, created_at): (String, String, i64) = conn
-        .query_row(
-            "SELECT title, model, created_at FROM conversations WHERE id = ?1",
-            params![conversation_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .map_err(|e| format!("Conversation not found: {e}"))?;
+        let (title, model, created_at): (String, String, i64) = conn
+            .query_row(
+                "SELECT title, model, created_at FROM conversations WHERE id = ?1",
+                params![conversation_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .map_err(|e| format!("Conversation not found: {e}"))?;
 
-    let mut stmt = conn
-        .prepare("SELECT id, conversation_id, role, content, model, created_at FROM messages WHERE conversation_id = ?1 ORDER BY id ASC")
-        .map_err(|e| format!("Query error: {e}"))?;
+        let mut stmt = conn
+            .prepare("SELECT id, conversation_id, role, content, model, created_at FROM messages WHERE conversation_id = ?1 ORDER BY id ASC")
+            .map_err(|e| format!("Query error: {e}"))?;
 
-    let msgs: Vec<StoredMessage> = stmt
-        .query_map(params![conversation_id], |row| {
-            Ok(StoredMessage {
-                id: row.get(0)?,
-                conversation_id: row.get(1)?,
-                role: row.get(2)?,
-                content: row.get(3)?,
-                model: row.get(4)?,
-                created_at: row.get(5)?,
+        let msgs: Vec<StoredMessage> = stmt
+            .query_map(params![conversation_id], |row| {
+                Ok(StoredMessage {
+                    id: row.get(0)?,
+                    conversation_id: row.get(1)?,
+                    role: row.get(2)?,
+                    content: row.get(3)?,
+                    model: row.get(4)?,
+                    created_at: row.get(5)?,
+                })
             })
-        })
-        .map_err(|e| format!("Failed to map messages: {e}"))?
-        .filter_map(Result::ok)
-        .collect();
+            .map_err(|e| format!("Failed to map messages: {e}"))?
+            .filter_map(Result::ok)
+            .collect();
 
-    let payload = ExportJsonPayload {
-        conversation_id: &conversation_id,
-        title: &title,
-        model: &model,
-        created_at,
-        exported_at: now_ms(),
-        messages: msgs,
+        (title, model, created_at, msgs)
     };
 
-    let json = serde_json::to_string_pretty(&payload)
-        .map_err(|e| format!("JSON serialization failed: {e}"))?;
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let payload = ExportJsonPayload {
+            conversation_id: &conversation_id,
+            title: &title,
+            model: &model,
+            created_at,
+            exported_at: now_ms(),
+            messages: msgs,
+        };
 
-    fs::write(&dest, json)
-        .map_err(|e| format!("Failed to write export file: {e}"))?;
+        let json = serde_json::to_string_pretty(&payload)
+            .map_err(|e| format!("JSON serialization failed: {e}"))?;
+
+        fs::write(&dest, json)
+            .map_err(|e| format!("Failed to write export file: {e}"))?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("JSON export worker panicked: {e}"))??;
 
     Ok(())
 }
 
 #[tauri::command]
-pub fn db_reset_sandbox() -> Result<String, String> {
-    let app_dir = std::env::var("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir())
-        .join("nexus");
-    let sandbox_path = app_dir.join("sandbox.db");
-
+pub fn db_reset_sandbox(state: State<'_, DbState>) -> Result<String, String> {
+    let sandbox_path = state.app_data_dir.join("sandbox.db");
     if sandbox_path.exists() {
         let _ = fs::remove_file(&sandbox_path);
     }
 
+    // Also clean up any legacy sandbox path from pre-v1 builds
+    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+        let legacy_path = PathBuf::from(local_app_data).join("nexus").join("sandbox.db");
+        if legacy_path.exists() {
+            let _ = fs::remove_file(&legacy_path);
+        }
+    }
+
     Ok("Sandbox database reset successfully.".to_string())
+}
+
+// Howard Hinnant civil-from-days algorithm for dependency-free dynamic UTC date fallback
+fn utc_date_from_ms(ts_ms: i64) -> String {
+    let z = (ts_ms / 1000).div_euclid(86_400) + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    format!("{year:04}-{m:02}-{d:02}")
 }
 
 // ================= TELEMETRY & USAGE =================
@@ -1537,7 +1730,7 @@ pub fn db_record_telemetry(
                 params![ts],
                 |r| r.get(0),
             )
-            .unwrap_or_else(|_| "2026-11-20".to_string()),
+            .unwrap_or_else(|_| utc_date_from_ms(ts)),
     };
 
     conn.execute(
@@ -1565,9 +1758,9 @@ pub fn db_get_telemetry_stats(
     local_date: Option<String>,
 ) -> Result<TelemetryStats, String> {
     let conn = state
-        .conn
+        .read_conn
         .lock()
-        .map_err(|_| "Database lock poisoned".to_string())?;
+        .map_err(|_| "Database read lock poisoned".to_string())?;
 
     let today_date: String = match local_date {
         Some(d) if !d.trim().is_empty() => d,
@@ -1578,7 +1771,7 @@ pub fn db_get_telemetry_stats(
                 params![ts],
                 |r| r.get(0),
             )
-            .unwrap_or_else(|_| "2026-11-20".to_string())
+            .unwrap_or_else(|_| utc_date_from_ms(ts))
         }
     };
 
@@ -1661,6 +1854,269 @@ pub fn db_get_telemetry_stats(
     })
 }
 
+// Validates that a setting key is in the explicit allowlist and value is within safe bounds
+fn validate_setting_key_and_value(key: &str, value: &str) -> Result<(), String> {
+    let is_allowed_key = matches!(key, "groq_api_key" | "cloud_auto_fallback")
+        || (key.starts_with("ws_offline_") && validate_safe_id(&key["ws_offline_".len()..]).is_ok());
+
+    if !is_allowed_key {
+        return Err(format!("Setting key '{key}' is not permitted."));
+    }
+
+    if value.len() > 2048 {
+        return Err("Setting value exceeds maximum allowed length (2048 bytes).".to_string());
+    }
+
+    Ok(())
+}
+
+// Masks secret API keys so raw credentials never cross the IPC boundary back to the webview
+fn mask_secret_value(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let chars: Vec<char> = trimmed.chars().collect();
+    if chars.len() <= 8 {
+        Some("••••••••".to_string())
+    } else {
+        let prefix: String = chars[..4].iter().collect();
+        let suffix: String = chars[chars.len() - 4..].iter().collect();
+        Some(format!("{prefix}••••••••{suffix}"))
+    }
+}
+
+fn is_secret_setting_key(key: &str) -> bool {
+    key == "groq_api_key" || key.ends_with("_api_key")
+}
+
+#[cfg(target_os = "windows")]
+mod secret_store {
+    use std::ffi::c_void;
+    use std::ptr;
+
+    const DPAPI_PREFIX: &str = "dpapi:";
+    const CRYPTPROTECT_UI_FORBIDDEN: u32 = 0x1;
+
+    #[repr(C)]
+    struct DataBlob {
+        cb_data: u32,
+        pb_data: *mut u8,
+    }
+
+    #[link(name = "crypt32")]
+    unsafe extern "system" {
+        fn CryptProtectData(
+            p_data_in: *const DataBlob,
+            sz_data_descr: *const u16,
+            p_optional_entropy: *const DataBlob,
+            pv_reserved: *mut c_void,
+            p_prompt_struct: *mut c_void,
+            dw_flags: u32,
+            p_data_out: *mut DataBlob,
+        ) -> i32;
+
+        fn CryptUnprotectData(
+            p_data_in: *const DataBlob,
+            ppsz_data_descr: *mut *mut u16,
+            p_optional_entropy: *const DataBlob,
+            pv_reserved: *mut c_void,
+            p_prompt_struct: *mut c_void,
+            dw_flags: u32,
+            p_data_out: *mut DataBlob,
+        ) -> i32;
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn LocalFree(h_mem: *mut c_void) -> *mut c_void;
+    }
+
+    fn hex_encode(bytes: &[u8]) -> String {
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            use std::fmt::Write;
+            let _ = write!(&mut out, "{b:02x}");
+        }
+        out
+    }
+
+    fn hex_decode(hex: &str) -> Option<Vec<u8>> {
+        if hex.len() % 2 != 0 {
+            return None;
+        }
+        let mut out = Vec::with_capacity(hex.len() / 2);
+        for pair in hex.as_bytes().chunks_exact(2) {
+            let s = std::str::from_utf8(pair).ok()?;
+            out.push(u8::from_str_radix(s, 16).ok()?);
+        }
+        Some(out)
+    }
+
+    /// Protects a secret at rest with Windows DPAPI (scoped to the current OS user profile).
+    pub fn encrypt_secret(plaintext: &str) -> Result<String, String> {
+        if plaintext.is_empty() {
+            return Ok(String::new());
+        }
+        let mut input = plaintext.as_bytes().to_vec();
+        let in_blob = DataBlob {
+            cb_data: input.len() as u32,
+            pb_data: input.as_mut_ptr(),
+        };
+        let mut out_blob = DataBlob {
+            cb_data: 0,
+            pb_data: ptr::null_mut(),
+        };
+
+        let ok = unsafe {
+            CryptProtectData(
+                &in_blob,
+                ptr::null(),
+                ptr::null(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut out_blob,
+            )
+        };
+
+        if ok == 0 || out_blob.pb_data.is_null() {
+            return Err("OS credential encryption (DPAPI) failed.".to_string());
+        }
+
+        let encrypted = unsafe {
+            let slice = std::slice::from_raw_parts(out_blob.pb_data, out_blob.cb_data as usize);
+            let copied = slice.to_vec();
+            LocalFree(out_blob.pb_data as *mut c_void);
+            copied
+        };
+
+        Ok(format!("{DPAPI_PREFIX}{}", hex_encode(&encrypted)))
+    }
+
+    /// Decrypts a DPAPI-protected value, falling back transparently for legacy plaintext rows.
+    pub fn decrypt_secret(stored: &str) -> Option<String> {
+        let Some(hex_payload) = stored.strip_prefix(DPAPI_PREFIX) else {
+            return Some(stored.to_string());
+        };
+        let mut cipher = hex_decode(hex_payload)?;
+        let in_blob = DataBlob {
+            cb_data: cipher.len() as u32,
+            pb_data: cipher.as_mut_ptr(),
+        };
+        let mut out_blob = DataBlob {
+            cb_data: 0,
+            pb_data: ptr::null_mut(),
+        };
+
+        let ok = unsafe {
+            CryptUnprotectData(
+                &in_blob,
+                ptr::null_mut(),
+                ptr::null(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut out_blob,
+            )
+        };
+
+        if ok == 0 || out_blob.pb_data.is_null() {
+            return None;
+        }
+
+        let decrypted = unsafe {
+            let slice = std::slice::from_raw_parts(out_blob.pb_data, out_blob.cb_data as usize);
+            let copied = slice.to_vec();
+            LocalFree(out_blob.pb_data as *mut c_void);
+            copied
+        };
+
+        String::from_utf8(decrypted).ok()
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+mod secret_store {
+    pub fn encrypt_secret(plaintext: &str) -> Result<String, String> {
+        Ok(plaintext.to_string())
+    }
+
+    pub fn decrypt_secret(stored: &str) -> Option<String> {
+        Some(stored.to_string())
+    }
+}
+
+// Internal helper for retrieving a key-value setting directly from SQLite (auto-decrypts API keys)
+pub fn get_setting_internal(conn: &Connection, key: &str) -> Option<String> {
+    let raw: String = conn
+        .query_row(
+            "SELECT value FROM app_settings WHERE key = ?1",
+            params![key],
+            |r| r.get(0),
+        )
+        .ok()?;
+    if is_secret_setting_key(key) {
+        secret_store::decrypt_secret(&raw)
+    } else {
+        Some(raw)
+    }
+}
+
+// Internal helper for updating or inserting a key-value setting directly in SQLite (encrypts API keys at rest)
+pub fn set_setting_internal(conn: &Connection, key: &str, value: &str) -> Result<(), String> {
+    validate_setting_key_and_value(key, value)?;
+    let stored_value = if is_secret_setting_key(key) {
+        secret_store::encrypt_secret(value)?
+    } else {
+        value.to_string()
+    };
+    let ts = now_ms();
+    conn.execute(
+        "INSERT INTO app_settings (key, value, updated_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        params![key, stored_value, ts],
+    )
+    .map_err(|e| format!("Failed to save setting '{key}': {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn db_get_setting(
+    state: State<'_, DbState>,
+    key: String,
+) -> Result<Option<String>, String> {
+    validate_setting_key_and_value(&key, "")?;
+    let conn = state
+        .read_conn
+        .lock()
+        .map_err(|_| "Database read lock poisoned".to_string())?;
+    let raw = get_setting_internal(&conn, &key);
+    if key == "groq_api_key" || key.ends_with("_api_key") {
+        Ok(raw.and_then(|v| mask_secret_value(&v)))
+    } else {
+        Ok(raw)
+    }
+}
+
+#[tauri::command]
+pub async fn db_set_setting(
+    state: State<'_, DbState>,
+    key: String,
+    value: String,
+) -> Result<(), String> {
+    validate_setting_key_and_value(&key, &value)?;
+    // Ignore no-op saves of an already-masked key string from the UI
+    if (key == "groq_api_key" || key.ends_with("_api_key")) && value.contains('•') {
+        return Ok(());
+    }
+    let conn = state
+        .conn
+        .lock()
+        .map_err(|_| "Database lock poisoned".to_string())?;
+    set_setting_internal(&conn, &key, &value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1707,5 +2163,134 @@ mod tests {
             )
             .unwrap();
         assert_eq!(matched, 1);
+    }
+
+    #[test]
+    fn test_app_settings_upsert_and_retrieve() {
+        let conn = Connection::open_in_memory().expect("in-memory sqlite");
+        assert!(ensure_schema(&conn).is_ok());
+
+        assert_eq!(get_setting_internal(&conn, "groq_api_key"), None);
+        assert!(set_setting_internal(&conn, "groq_api_key", "gsk_test123").is_ok());
+        assert_eq!(
+            get_setting_internal(&conn, "groq_api_key"),
+            Some("gsk_test123".to_string())
+        );
+
+        // Test update
+        assert!(set_setting_internal(&conn, "groq_api_key", "gsk_updated456").is_ok());
+        assert_eq!(
+            get_setting_internal(&conn, "groq_api_key"),
+            Some("gsk_updated456".to_string())
+        );
+
+        // Verify allowlist and masking logic
+        assert!(set_setting_internal(&conn, "unauthorized_key", "val").is_err());
+        assert!(set_setting_internal(&conn, "ws_offline_ws_123", "true").is_ok());
+        assert_eq!(
+            mask_secret_value("gsk_1234567890abcdef"),
+            Some("gsk_••••••••cdef".to_string())
+        );
+    }
+
+    #[test]
+    fn test_scrub_backup_secrets_fail_closed_and_removes_keys() {
+        let temp_path = std::env::temp_dir().join(format!(
+            "nexus_backup_scrub_test_{}.sqlite",
+            generate_id("t")
+        ));
+        {
+            let conn = Connection::open(&temp_path).expect("temp sqlite");
+            ensure_schema(&conn).expect("schema");
+            set_setting_internal(&conn, "groq_api_key", "gsk_super_secret").unwrap();
+            set_setting_internal(&conn, "cloud_auto_fallback", "true").unwrap();
+        }
+
+        assert!(scrub_backup_secrets(&temp_path).is_ok());
+
+        {
+            let conn = Connection::open(&temp_path).expect("reopen temp sqlite");
+            assert_eq!(get_setting_internal(&conn, "groq_api_key"), None);
+            assert_eq!(
+                get_setting_internal(&conn, "cloud_auto_fallback"),
+                Some("true".to_string())
+            );
+        }
+
+        let _ = fs::remove_file(&temp_path);
+        // Fail closed when target file does not exist
+        assert!(scrub_backup_secrets(&temp_path).is_err());
+    }
+
+    #[test]
+    fn test_secret_encrypted_at_rest_and_paginated_messages_newest_first() {
+        let conn = Connection::open_in_memory().expect("in-memory sqlite");
+        ensure_schema(&conn).expect("schema");
+
+        // Verify secret is encrypted at rest on Windows and transparently decrypted on read
+        set_setting_internal(&conn, "groq_api_key", "gsk_dpapi_secret_999").unwrap();
+        let raw_stored: String = conn
+            .query_row(
+                "SELECT value FROM app_settings WHERE key = 'groq_api_key'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        #[cfg(target_os = "windows")]
+        {
+            assert!(raw_stored.starts_with("dpapi:"));
+            assert!(!raw_stored.contains("gsk_dpapi_secret_999"));
+        }
+        assert_eq!(
+            get_setting_internal(&conn, "groq_api_key"),
+            Some("gsk_dpapi_secret_999".to_string())
+        );
+
+        // Verify newest-first pagination returns latest messages in chronological order
+        conn.execute(
+            "INSERT INTO conversations (id, title, model, created_at, updated_at) VALUES ('conv_p', 'Long Chat', 'local', 1, 1)",
+            [],
+        )
+        .unwrap();
+        for idx in 1..=10 {
+            conn.execute(
+                "INSERT INTO messages (conversation_id, role, content, created_at) VALUES ('conv_p', 'user', ?1, ?2)",
+                params![format!("msg-{idx}"), idx],
+            )
+            .unwrap();
+        }
+
+        let latest_three = fetch_messages_page(&conn, "conv_p", None, 3).unwrap();
+        assert_eq!(latest_three.len(), 3);
+        assert_eq!(latest_three[0].content, "msg-8");
+        assert_eq!(latest_three[2].content, "msg-10");
+
+        let older_three = fetch_messages_page(&conn, "conv_p", Some(latest_three[0].id), 3).unwrap();
+        assert_eq!(older_three.len(), 3);
+        assert_eq!(older_three[0].content, "msg-5");
+        assert_eq!(older_three[2].content, "msg-7");
+    }
+
+    #[test]
+    fn test_db_state_separates_wal_reader_and_writer() {
+        let temp_dir = std::env::temp_dir().join(format!("nexus_wal_rw_test_{}", generate_id("d")));
+        let state = DbState::initialize(temp_dir.clone()).expect("init db state");
+
+        {
+            let writer = state.conn.lock().unwrap();
+            set_setting_internal(&writer, "cloud_auto_fallback", "true").unwrap();
+        }
+        {
+            let reader = state.read_conn.lock().unwrap();
+            assert_eq!(
+                get_setting_internal(&reader, "cloud_auto_fallback"),
+                Some("true".to_string())
+            );
+            // Read-only connection must reject writes
+            assert!(set_setting_internal(&reader, "cloud_auto_fallback", "false").is_err());
+        }
+
+        drop(state);
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }
